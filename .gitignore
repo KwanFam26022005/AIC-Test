@@ -1,0 +1,25 @@
+# ==========================================
+# 1. Venv
+# ==========================================
+.venv/
+venv*/
+embedding/
+.transnetv2/
+ENV/
+env/
+# Các file cache compile của Python
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# ==========================================
+# 2. Data
+# ==========================================
+data/
+
+*.faiss
+*.bin
+*.npy
+*.index
+*.log
+.env
