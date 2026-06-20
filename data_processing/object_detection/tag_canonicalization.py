@@ -87,6 +87,15 @@ SYNONYM_MAP = {
     "motorbike": "motorcycle",
     "scooter": "motorcycle",
     "bike": "bicycle",
+    # Medical synonyms
+    "surgeon": "doctor",
+    "dentist": "doctor",
+    "operating room": "hospital",
+    "operating_room": "hospital",
+    "hospital room": "hospital",
+    "emergency room": "hospital",
+    "ward": "hospital",
+    "clinic": "hospital",
 }
 
 # Hypernym chains: generic_tag → list of specific tags
@@ -141,6 +150,9 @@ NON_OBJECT_TAGS = frozenset({
     # Qualities / adjectives
     "large", "small", "big", "tall", "short", "long", "wide", "narrow",
     "old", "new", "young", "beautiful", "dirty", "clean", "wet", "dry",
+    # Medical abstract terms
+    "operate", "operation", "surgery", "perform", "job",
+    "procedure", "treatment", "therapy", "diagnosis",
 })
 
 

@@ -141,12 +141,40 @@ def hex_to_rgb(hex_color):
     return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 
-def draw_frame(image, objects, font=None):
-    """Vẽ bounding boxes + labels lên 1 ảnh.
+def wrap_text(text, font, max_width, draw):
+    """Chia văn bản thành các dòng phù hợp với chiều rộng tối đa (pixels)."""
+    words = text.split(" ")
+    lines = []
+    current_line = []
+
+    for word in words:
+        if not word:
+            continue
+        test_line = " ".join(current_line + [word]) if current_line else word
+        bbox = draw.textbbox((0, 0), test_line, font=font)
+        w = bbox[2] - bbox[0]
+        if w <= max_width:
+            current_line.append(word)
+        else:
+            if current_line:
+                lines.append(" ".join(current_line))
+                current_line = [word]
+            else:
+                lines.append(word)
+                current_line = []
+
+    if current_line:
+        lines.append(" ".join(current_line))
+    return lines
+
+
+def draw_frame(image, objects, tags=None, font=None):
+    """Vẽ bounding boxes + labels + tags danh sách lên 1 ảnh.
 
     Args:
         image: PIL.Image — ảnh gốc
         objects: list[dict] — [{"label", "score", "box"}]
+        tags: list[str] — danh sách tags của frame từ RAM++
         font: ImageFont — optional, sẽ auto-load nếu None
 
     Returns:
@@ -158,6 +186,7 @@ def draw_frame(image, objects, font=None):
     annotated = image.convert("RGB").copy()
     draw = ImageDraw.Draw(annotated)
 
+    # 1. Vẽ bounding boxes của các objects
     for idx, obj in enumerate(objects):
         label = obj["label"]
         score = obj["score"]
@@ -189,9 +218,59 @@ def draw_frame(image, objects, font=None):
         # Text (white on colored background)
         draw.text((x0 + 4, label_y + 2), text, fill="white", font=font)
 
-    # Draw summary info at top-left
+    # 2. Vẽ bảng thông tin (Summary & Tags) ở góc trên bên trái
     summary_text = f"{len(objects)} objects detected"
-    draw.text((10, 10), summary_text, fill="white", font=font)
+    raw_tags_text = f"Tags: {', '.join(tags)}" if tags else "Tags: none"
+
+    # Tính toán độ rộng tối đa để xuống dòng cho tags (tránh tràn viền ảnh)
+    max_text_width = min(800, annotated.width - 40)
+    wrapped_tag_lines = wrap_text(raw_tags_text, font, max_text_width, draw)
+
+    # Tính toán kích thước cho background box
+    line_spacing = 6
+    padding = 12
+
+    bbox_sum = draw.textbbox((0, 0), summary_text, font=font)
+    h_sum = bbox_sum[3] - bbox_sum[1]
+    w_sum = bbox_sum[2] - bbox_sum[0]
+
+    h_tags = []
+    w_tags = []
+    for line in wrapped_tag_lines:
+        bbox_l = draw.textbbox((0, 0), line, font=font)
+        h_tags.append(bbox_l[3] - bbox_l[1])
+        w_tags.append(bbox_l[2] - bbox_l[0])
+
+    total_text_height = h_sum + sum(h_tags) + line_spacing * (len(wrapped_tag_lines) + 1)
+    max_w = max([w_sum] + w_tags)
+
+    box_w = max_w + padding * 2
+    box_h = total_text_height + padding * 2
+
+    # Vẽ background box màu xám đậm, bo viền nhẹ
+    draw.rectangle(
+        [10, 10, 10 + box_w, 10 + box_h],
+        fill=(25, 25, 25),
+        outline=(80, 80, 80),
+        width=1
+    )
+
+    # Vẽ nội dung text
+    current_y = 10 + padding
+    draw.text((10 + padding, current_y), summary_text, fill=(255, 255, 255), font=font)
+    current_y += h_sum + line_spacing + 2  # Separator space
+
+    # Vẽ một đường gạch ngang phân cách nhẹ
+    draw.line(
+        [10 + padding, current_y, 10 + padding + max_w, current_y],
+        fill=(80, 80, 80),
+        width=1
+    )
+    current_y += line_spacing
+
+    for line, h_l in zip(wrapped_tag_lines, h_tags):
+        draw.text((10 + padding, current_y), line, fill=(200, 200, 200), font=font)
+        current_y += h_l + line_spacing
 
     return annotated
 
@@ -262,9 +341,10 @@ def visualize_from_jsonl(images_dir, metadata_path, output_dir,
 
         doc = metadata[stem]
         objects = doc.get("objects", [])
+        tags = doc.get("tags", [])
 
         image = Image.open(str(img_path)).convert("RGB")
-        annotated = draw_frame(image, objects, font=font)
+        annotated = draw_frame(image, objects, tags=tags, font=font)
 
         out_path = os.path.join(output_dir, f"{stem}_annotated.jpg")
         annotated.save(out_path, quality=90)

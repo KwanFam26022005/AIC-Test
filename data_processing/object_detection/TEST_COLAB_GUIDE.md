@@ -152,7 +152,25 @@ with open("/content/output/L21_V001.jsonl") as f:
             break
 ```
 
-## 9. Download output
+## 9. Giả lập tìm kiếm (Search Simulator)
+
+Sau khi tạo xong file `.jsonl` chứa metadata của video, bạn có thể chạy thử công cụ tìm kiếm giả lập:
+
+```python
+# Chạy câu query trực tiếp từ CLI
+!python search_simulator.py \
+    --metadata /content/output/L21_V001.jsonl \
+    --query "2 person and fish"
+```
+
+Hoặc chạy chế độ tương tác (interactive) để thử nhiều câu query khác nhau trực tiếp trên notebook:
+```python
+import sys
+# Chạy interactive shell giả lập
+!python search_simulator.py --metadata /content/output/L21_V001.jsonl
+```
+
+## 10. Download output
 
 ```python
 from google.colab import files
