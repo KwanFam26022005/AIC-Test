@@ -88,7 +88,7 @@ RAM_CHECKPOINT_URL = (
 GDINO_MODEL_ID = "IDEA-Research/grounding-dino-base"
 
 # Detection thresholds (có thể override qua CLI)
-DEFAULT_BOX_THRESHOLD = 0.35
+DEFAULT_BOX_THRESHOLD = 0.3
 DEFAULT_TEXT_THRESHOLD = 0.25
 DEFAULT_NMS_IOU_THRESHOLD = 0.7
 

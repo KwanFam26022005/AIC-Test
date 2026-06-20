@@ -315,7 +315,7 @@ LABEL_NORMALIZE_MAP = {
 
 # Ngưỡng diện tích tối đa cho bbox (tỷ lệ so với ảnh)
 # Bbox chiếm > threshold → loại (scene-level, không phải object riêng lẻ)
-SCENE_AREA_THRESHOLD = 0.5
+SCENE_AREA_THRESHOLD = 0.6
 
 
 def normalize_label(label):
