@@ -1,0 +1,21 @@
+# ==============================================================================
+# Requirements for RAM++ & GroundingDINO Object Detection Pipeline
+# ==============================================================================
+
+# Core deep learning framework (Recommended to be pre-installed with CUDA support)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# HuggingFace Transformers (MUST pin to 4.46.3 for RAM++ / GroundingDINO compatibility)
+transformers==4.46.3
+huggingface_hub
+
+# RAM++ Dependencies
+timm>=0.4.12
+recognize-anything
+
+# Image & data processing utilities
+Pillow>=9.0.0
+tqdm>=4.65.0
+numpy>=1.20.0
+opencv-python>=4.7.0.0
