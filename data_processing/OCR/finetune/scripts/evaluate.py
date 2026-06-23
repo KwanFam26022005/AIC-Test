@@ -78,6 +78,10 @@ def log_metrics_to_csv(csv_path, phase, epoch, checkpoint_name, metrics):
         print(f"[!] Không thể ghi file CSV kết quả: {e}")
 
 def main():
+    # Đảm bảo thư mục hiện tại nằm trong python path để import được ppocr
+    if os.path.exists('./tools/eval.py'):
+        sys.path.insert(0, os.path.abspath('.'))
+        
     args = parse_args()
     
     print("=== PADDLEOCR DETECTION TEST EVALUATION ===")
@@ -117,18 +121,23 @@ def main():
     
     print(f"[*] Khởi chạy PaddleOCR eval với argv: {sys.argv}")
     
-    # Đảm bảo PaddleOCR nằm trong python path
-    if os.path.exists('./tools/eval.py'):
-        sys.path.insert(0, os.path.abspath('.'))
-    else:
+    # Đảm bảo PaddleOCR nằm trong python path (Đã thực hiện ở đầu hàm main)
+    if not os.path.exists('./tools/eval.py'):
         print("[!] Cảnh báo: Không tìm thấy tools/eval.py ở thư mục hiện tại.")
         
-    # 4. Import tools.eval và chạy main
+    # 4. Import tools.eval và chạy main (Kiểm tra tương thích signature main)
     try:
         import tools.eval as paddle_eval
+        import tools.program as program
+        import inspect
         
         # Chạy evaluation chính
-        paddle_eval.main()
+        sig = inspect.signature(paddle_eval.main)
+        if len(sig.parameters) == 0:
+            paddle_eval.main()
+        else:
+            config, device, logger, vdl_writer = program.preprocess()
+            paddle_eval.main(config, device, logger, vdl_writer)
         
         # 5. Ghi nhận kết quả
         if metrics_handler.metrics:

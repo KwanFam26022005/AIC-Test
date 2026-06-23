@@ -222,6 +222,10 @@ def setup_backbone_freezing(should_freeze):
         print(f"[!] Lỗi khi thiết lập freeze backbone: {e}")
 
 def main():
+    # Đảm bảo thư mục hiện tại nằm trong python path để import được ppocr
+    if os.path.exists('./tools/train.py'):
+        sys.path.insert(0, os.path.abspath('.'))
+        
     args = parse_args()
     
     # 1. Detect GPU
@@ -334,11 +338,8 @@ def main():
         
     print(f"[*] Khởi chạy PaddleOCR train với argv: {sys.argv}")
     
-    # Đảm bảo PaddleOCR nằm trong python path
-    # Thường ở Colab chúng ta chạy từ thư mục /content/PaddleOCR
-    if os.path.exists('./tools/train.py'):
-        sys.path.insert(0, os.path.abspath('.'))
-    else:
+    # Đảm bảo PaddleOCR nằm trong python path (Đã thực hiện ở đầu hàm main)
+    if not os.path.exists('./tools/train.py'):
         print("[!] Cảnh báo: Không tìm thấy tools/train.py ở thư mục hiện tại. Đang thử chạy giả định import...")
         
     # Tạo thư mục checkpoint trước để tránh lỗi log file ghi không được
@@ -357,8 +358,15 @@ def main():
         print(f"[*] BẮT ĐẦU TRAINING PHASE {run_phase}...")
         print("="*50 + "\n")
         
-        # Chạy train loop chính của PaddleOCR
-        paddle_train.main()
+        # Chạy train loop chính của PaddleOCR (Kiểm tra tương thích signature main)
+        import inspect
+        sig = inspect.signature(paddle_train.main)
+        if len(sig.parameters) == 0:
+            paddle_train.main()
+        else:
+            import tools.program as program
+            config, device, logger, vdl_writer = program.preprocess()
+            paddle_train.main(config, device, logger, vdl_writer)
         
         # Kết thúc thành công
         monitor.stop()
