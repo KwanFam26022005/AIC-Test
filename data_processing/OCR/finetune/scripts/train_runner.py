@@ -50,14 +50,14 @@ def detect_gpu():
             return {
                 'gpu': 'L4',
                 'vram_gb': 24,
-                'batch_size': {1: 16, 2: 16, 3: 8},
+                'batch_size': {1: 16, 2: 8, 3: 4},
                 'num_workers': 4
             }
         else: # Mặc định coi là T4
             return {
                 'gpu': 'T4',
                 'vram_gb': 16,
-                'batch_size': {1: 16, 2: 8, 3: 4},
+                'batch_size': {1: 8, 2: 4, 3: 2},
                 'num_workers': 2
             }
     except Exception as e:
@@ -65,7 +65,7 @@ def detect_gpu():
         return {
             'gpu': 'Default/T4',
             'vram_gb': 16,
-            'batch_size': {1: 16, 2: 8, 3: 4},
+            'batch_size': {1: 8, 2: 4, 3: 2},
             'num_workers': 2
         }
 
