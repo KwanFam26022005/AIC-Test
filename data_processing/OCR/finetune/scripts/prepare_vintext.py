@@ -7,8 +7,7 @@ Script chuẩn bị dataset VinText cho training PaddleOCR.
 2. Giải nén dataset.
 3. Chia dataset theo đúng tỷ lệ:
    - Train (Ảnh 1-1200)
-   - Val (Ảnh 1201-1500)
-   - Test (Ảnh 1501-2000)
+   - Val & Test (Ảnh 1201-1500) (Tránh tập Test bị rỗng do zip gốc chứa 1500 ảnh)
 4. Convert annotation sang format SimpleDataSet của PaddleOCR:
    path/to/img.jpg\t[{"transcription": "text", "points": [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]}, ...]
 """
@@ -173,27 +172,20 @@ def convert_and_split(extract_path, output_dir):
                     
         # Xác định split và copy ảnh
         if img_id <= 1200:
-            dest_dir = train_dest_dir
-            split_name = "train"
-            labels_list = train_labels
-        elif img_id <= 1500:
-            dest_dir = val_dest_dir
-            split_name = "val"
-            labels_list = val_labels
+            dest_img_path = os.path.join(train_dest_dir, img_name)
+            shutil.copy2(src_img_path, dest_img_path)
+            relative_path = f"train/{img_name}"
+            train_labels.append(f"{relative_path}\t{json.dumps(annotations, ensure_ascii=False)}")
         else:
-            dest_dir = test_dest_dir
-            split_name = "test"
-            labels_list = test_labels
+            # Lưu đồng thời vào val và test splits
+            val_img_path = os.path.join(val_dest_dir, img_name)
+            shutil.copy2(src_img_path, val_img_path)
+            val_labels.append(f"val/{img_name}\t{json.dumps(annotations, ensure_ascii=False)}")
             
-        # Copy file ảnh sang thư mục đích
-        dest_img_path = os.path.join(dest_dir, img_name)
-        shutil.copy2(src_img_path, dest_img_path)
-        
-        # Đường dẫn tương đối dùng trong label.txt của PaddleOCR
-        # PaddleOCR SimpleDataSet yêu cầu định dạng: path/to/image\tjson_label
-        # Chúng ta dùng đường dẫn tương đối từ data_dir: {split}/{img_name}
-        relative_path = f"{split_name}/{img_name}"
-        labels_list.append(f"{relative_path}\t{json.dumps(annotations, ensure_ascii=False)}")
+            test_img_path = os.path.join(test_dest_dir, img_name)
+            shutil.copy2(src_img_path, test_img_path)
+            test_labels.append(f"test/{img_name}\t{json.dumps(annotations, ensure_ascii=False)}")
+            
         processed_count += 1
         
     # Ghi file label.txt ra Drive
