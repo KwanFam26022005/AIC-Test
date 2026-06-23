@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument("--drive_dir", type=str, default=DRIVE_DIR, help="Đường dẫn gốc Google Drive")
     parser.add_argument("--phase", type=int, default=None, help="Chỉ định chạy cứng phase (1, 2, 3). Nếu để None sẽ chạy tự động theo progress.")
     parser.add_argument("--local_config_dir", type=str, default="./configs", help="Thư mục chứa config file cục bộ")
-    return parser.parse_args()
+    return parser.parse_known_args()
 
 def detect_gpu():
     """Detect GPU type và trả về cấu hình tối ưu."""
@@ -226,7 +226,7 @@ def main():
     if os.path.exists('./tools/train.py'):
         sys.path.insert(0, os.path.abspath('.'))
         
-    args = parse_args()
+    args, extra_args = parse_args()
     
     # 1. Detect GPU
     gpu_config = detect_gpu()
@@ -335,6 +335,8 @@ def main():
     sys.argv = ['tools/train.py', '-c', config_path]
     for ov in overrides:
         sys.argv.extend(['-o', ov])
+    # Bổ sung các tham số ghi đè tùy chọn do người dùng truyền vào từ dòng lệnh
+    sys.argv.extend(extra_args)
         
     print(f"[*] Khởi chạy PaddleOCR train với argv: {sys.argv}")
     
