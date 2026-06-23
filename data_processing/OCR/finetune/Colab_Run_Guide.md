@@ -23,10 +23,11 @@ drive.mount('/content/drive')
 !pip install paddlepaddle-gpu -q
 !pip install gdown albumentations -q
 
-# 3. Clone Repository chứa code fine-tune của bạn
+# 3. Clone Repository chứa code fine-tune của bạn và checkout nhánh Khoa
 %cd /content
 !git clone https://github.com/KwanFam26022005/AIC-Test.git
 %cd /content/AIC-Test
+!git checkout Khoa
 
 # 4. Clone PaddleOCR chính thức để sử dụng engine huấn luyện
 %cd /content
@@ -42,39 +43,26 @@ print("\n[+] Thiết lập môi trường hoàn tất!")
 ---
 
 ## Bước 3: Tạo cấu trúc thư mục trên Google Drive
-Chạy cell dưới đây để tạo cấu trúc thư mục lưu trữ thống nhất trên Google Drive:
+Chạy cell dưới đây để tạo cấu trúc thư mục lưu trữ dữ liệu, checkpoint và log trên Google Drive. Chúng ta sẽ lưu giữ dữ liệu huấn luyện và checkpoint tại Drive để không bị mất khi Colab ngắt kết nối:
 
 ```python
 import os
 
 drive_base = "/content/drive/MyDrive/OCR_finetune"
-subdirs = ["pretrained", "data", "checkpoints", "configs", "logs", "scripts"]
+subdirs = ["pretrained", "data", "checkpoints", "logs"]
 for sd in subdirs:
     os.makedirs(os.path.join(drive_base, sd), exist_ok=True)
 
 print(f"[+] Đã khởi tạo các thư mục lưu trữ tại: {drive_base}")
 ```
 
-Sau khi chạy xong, hãy copy hoặc di chuyển toàn bộ nội dung của repository `AIC-Test` vào thư mục Drive tương ứng để phục vụ quá trình huấn luyện:
-- Copy tất cả các file cấu hình `.yml` từ thư mục `configs/` vào `/content/drive/MyDrive/OCR_finetune/configs/`
-- Copy tất cả các script `.py` từ thư mục `scripts/` vào `/content/drive/MyDrive/OCR_finetune/scripts/`
-
-Bạn có thể thực hiện việc copy tự động bằng cell lệnh sau trên Colab:
-
-```bash
-# Copy configs
-!cp -r /content/AIC-Test/data_processing/OCR/finetune/configs/* /content/drive/MyDrive/OCR_finetune/configs/
-
-# Copy scripts
-!cp -r /content/AIC-Test/data_processing/OCR/finetune/scripts/* /content/drive/MyDrive/OCR_finetune/scripts/
-
-print("[+] Đã đồng bộ configs và scripts lên Google Drive!")
-```
+> [!TIP]
+> Bạn **KHÔNG** cần phải copy code hay cấu hình (.py và .yml) vào Google Drive. Colab sẽ chạy trực tiếp các file này từ thư mục dự án đã clone `/content/AIC-Test`. Điều này giúp bạn dễ dàng cập nhật code mới nhất từ GitHub bằng lệnh `!git checkout Khoa && !git pull` ngay trên Colab mà không phải sao chép thủ công.
 
 ---
 
 ## Bước 4: Tải Pretrained Weights của PP-OCRv6_medium_det
-Chạy cell này để tải pretrained weights từ HuggingFace lưu trữ trực tiếp lên Google Drive:
+Chạy cell này để tải pretrained weights từ Baidu BCE Bos lưu trữ trực tiếp lên Google Drive:
 
 ```python
 import os
@@ -82,7 +70,7 @@ import os
 weights_path = "/content/drive/MyDrive/OCR_finetune/pretrained/PP-OCRv6_medium_det.pdparams"
 if not os.path.exists(weights_path):
     print("[*] Đang tải pretrained weights PP-OCRv6_medium_det...")
-    url = "https://huggingface.co/PaddlePaddle/PP-OCRv6_medium_det/resolve/main/student.pdparams"
+    url = "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_pretrained_model/PP-OCRv6_medium_det_pretrained.pdparams"
     !wget -O {weights_path} {url}
     print("[+] Đã tải xong weights!")
 else:
@@ -92,11 +80,11 @@ else:
 ---
 
 ## Bước 5: Chuẩn bị bộ dữ liệu VinText
-Chạy script `prepare_vintext.py` để tự động tải, giải nén và phân chia dữ liệu VinText (Train 1200 / Val 300 / Test 500) đồng thời chuyển đổi nhãn sang định dạng PaddleOCR:
+Chạy script `prepare_vintext.py` trực tiếp từ repo đã clone để tự động tải, giải nén và phân chia dữ liệu VinText (Train 1200 / Val 300 / Test 300) đồng thời chuyển đổi nhãn sang định dạng PaddleOCR:
 
 ```bash
-# Chạy script chuẩn bị dữ liệu
-!python /content/drive/MyDrive/OCR_finetune/scripts/prepare_vintext.py \
+# Chạy script chuẩn bị dữ liệu trực tiếp từ repository
+!python /content/AIC-Test/data_processing/OCR/finetune/scripts/prepare_vintext.py \
     --output_dir /content/drive/MyDrive/OCR_finetune/data/vintext \
     --download_dir /content/tmp_vintext
 ```
@@ -104,14 +92,18 @@ Chạy script `prepare_vintext.py` để tự động tải, giải nén và ph�
 ---
 
 ## Bước 6: Chạy Master Training Runner (Tự động 3 Phase)
-Chạy cell dưới đây để bắt đầu huấn luyện. Script sẽ tự động nhận diện GPU của bạn, chọn cấu hình tối ưu, tự động resume từ checkpoint gần nhất trên Drive nếu bị ngắt kết nối đột ngột:
+Chạy cell dưới đây để bắt đầu huấn luyện. Script sẽ tự động nhận diện GPU của bạn, chọn cấu hình tối ưu, tự động resume từ checkpoint gần nhất trên Drive nếu bị ngắt kết nối đột ngột. 
+
+Chúng ta chỉ rõ đường dẫn thư mục configs gốc nằm trong repo thông qua tham số `--local_config_dir`:
 
 ```python
 # Di chuyển vào thư mục PaddleOCR để import các module hệ thống chính xác
 %cd /content/PaddleOCR
 
-# Thực thi huấn luyện tự động
-!python /content/drive/MyDrive/OCR_finetune/scripts/train_runner.py --drive_dir /content/drive/MyDrive/OCR_finetune
+# Thực thi huấn luyện tự động sử dụng code và config từ repository
+!python /content/AIC-Test/data_processing/OCR/finetune/scripts/train_runner.py \
+    --drive_dir /content/drive/MyDrive/OCR_finetune \
+    --local_config_dir /content/AIC-Test/data_processing/OCR/finetune/configs
 ```
 
 *Lưu ý: Nếu Colab bị disconnect hoặc hết thời gian chạy, bạn chỉ cần mở lại notebook, chạy lại **Bước 2** để mount Drive & cài đặt thư viện, sau đó chạy lại cell của **Bước 6** này để tiếp tục tự động huấn luyện từ epoch đang dở.*
@@ -119,29 +111,29 @@ Chạy cell dưới đây để bắt đầu huấn luyện. Script sẽ tự đ
 ---
 
 ## Bước 7: Đánh giá mô hình trên tập Test
-Sau khi hoàn thành huấn luyện, chạy cell dưới đây để đánh giá độ chính xác (Precision, Recall, Hmean) của mô hình trên tập dữ liệu Test độc lập (500 ảnh) của VinText:
+Sau khi hoàn thành huấn luyện, chạy cell dưới đây để đánh giá độ chính xác (Precision, Recall, Hmean) của mô hình trên tập dữ liệu Test độc lập (300 ảnh) của VinText:
 
 ```python
-eval_script = "/content/drive/MyDrive/OCR_finetune/scripts/evaluate.py"
+eval_script = "/content/AIC-Test/data_processing/OCR/finetune/scripts/evaluate.py"
 %cd /content/PaddleOCR
 
 # Đánh giá Phase 1 (Freeze backbone)
 print("=== ĐÁNH GIÁ PHASE 1 ===")
-config1 = "/content/drive/MyDrive/OCR_finetune/configs/finetune_phase1.yml"
+config1 = "/content/AIC-Test/data_processing/OCR/finetune/configs/finetune_phase1.yml"
 ckpt1 = "/content/drive/MyDrive/OCR_finetune/checkpoints/phase1_freeze/best_accuracy"
 if os.path.exists(ckpt1 + ".pdparams"):
     !python {eval_script} --config {config1} --checkpoint {ckpt1} --phase 1 --epoch 40
 
 # Đánh giá Phase 2 (Unfreeze all)
 print("\n=== ĐÁNH GIÁ PHASE 2 ===")
-config2 = "/content/drive/MyDrive/OCR_finetune/configs/finetune_phase2.yml"
+config2 = "/content/AIC-Test/data_processing/OCR/finetune/configs/finetune_phase2.yml"
 ckpt2 = "/content/drive/MyDrive/OCR_finetune/checkpoints/phase2_unfreeze/best_accuracy"
 if os.path.exists(ckpt2 + ".pdparams"):
     !python {eval_script} --config {config2} --checkpoint {ckpt2} --phase 2 --epoch 60
 
 # Đánh giá Phase 3 (High-res)
 print("\n=== ĐÁNH GIÁ PHASE 3 ===")
-config3 = "/content/drive/MyDrive/OCR_finetune/configs/finetune_phase3.yml"
+config3 = "/content/AIC-Test/data_processing/OCR/finetune/configs/finetune_phase3.yml"
 ckpt3 = "/content/drive/MyDrive/OCR_finetune/checkpoints/phase3_highres/best_accuracy"
 if os.path.exists(ckpt3 + ".pdparams"):
     !python {eval_script} --config {config3} --checkpoint {ckpt3} --phase 3 --epoch 30
