@@ -1,0 +1,75 @@
+project:
+  video_id: "L25_V001"
+  frames_dir: "./frames/L25_V001"
+  output_dir: "./outputs/L25_V001"
+  resume: true
+
+runtime:
+  device: "cuda:0"
+  seed: 42
+  num_workers_io: 4
+  save_every_n_frames: 1000
+  log_every_n_frames: 100
+
+dedup:
+  frame_phash: false
+
+ppocr:
+  enabled: true
+  ocr_version: "PP-OCRv6"
+  lang: "vi"
+  use_doc_orientation_classify: false
+  use_doc_unwarping: false
+  use_textline_orientation: false
+  text_det_limit_side_len: 1216
+  text_det_thresh: 0.35
+  text_det_box_thresh: 0.60
+  text_det_unclip_ratio: 2.0
+  text_rec_score_thresh: 0.0
+
+risk:
+  confidence_low: 0.75
+  confidence_medium: 0.90
+  min_text_len: 2
+  suspicious_chars: ["Ä", "Ë", "�", "□", "训", "|", "¦"]
+  enable_vietnamese_spell_rules: true
+  enable_temporal_disagreement: false
+  vlm_risk_threshold: 0.45
+
+grouping:
+  vertical_gap: 15
+  horizontal_gap: 15
+  crop_padding: 20
+  min_crop_side: 64
+  max_crop_side: 1024
+
+vlm:
+  enabled: true
+  provider: "huggingface_transformers"
+  model_id: "5CD-AI/Vintern-3B-beta"
+  alternative_model_id: "5CD-AI/Vintern-3B-R-beta"
+  benchmark_model_ids:
+    - "5CD-AI/Vintern-3B-beta"
+    - "5CD-AI/Vintern-3B-R-beta"
+    - "erax-ai/EraX-VL-2B-V1.5"
+  allow_model_switch: true
+  quantization: "4bit_nf4"
+  device: "cuda:0"
+  device_map: "auto"
+  do_sample: false
+  temperature: 0.0
+  max_new_tokens_base: 64
+  max_new_tokens_per_line: 24
+  max_new_tokens_cap: 192
+  batch_size: 1
+  strict_json: true
+  cache_enabled: true
+  cache_path: "./outputs/L25_V001/vlm_cache.sqlite"
+
+es:
+  enabled: true
+  hosts: ["http://localhost:9200"]
+  index_name: "video_frames_v1"
+  bulk_size: 500
+  request_timeout: 120
+

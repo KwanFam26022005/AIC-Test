@@ -1,0 +1,20 @@
+pandas
+pyarrow
+Pillow
+PyYAML
+tqdm
+elasticsearch
+pytest
+
+# PP-OCR stage, install in its own Colab/server runtime when possible:
+# paddleocr>=3.0.0
+# paddlepaddle-gpu
+
+# VLM stage, install in a separate runtime if Paddle CUDA packages conflict:
+# transformers==4.44.2
+# accelerate
+# einops
+# timm
+# sentencepiece
+# bitsandbytes
+

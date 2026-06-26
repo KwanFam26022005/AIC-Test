@@ -1,0 +1,94 @@
+{
+  "settings": {
+    "analysis": {
+      "filter": {
+        "vi_edge_ngram_filter": {
+          "type": "edge_ngram",
+          "min_gram": 2,
+          "max_gram": 20
+        }
+      },
+      "analyzer": {
+        "vi_text": {
+          "type": "custom",
+          "tokenizer": "standard",
+          "filter": ["lowercase", "asciifolding"]
+        },
+        "vi_search_as_you_type": {
+          "type": "custom",
+          "tokenizer": "standard",
+          "filter": ["lowercase", "asciifolding", "vi_edge_ngram_filter"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "dynamic": false,
+    "properties": {
+      "video_id": {"type": "keyword"},
+      "frame_id": {"type": "keyword"},
+      "frame_number": {"type": "integer"},
+      "timestamp_ms": {"type": "long"},
+      "frame_path": {"type": "keyword", "index": false},
+      "image": {
+        "properties": {
+          "width": {"type": "integer"},
+          "height": {"type": "integer"},
+          "phash": {"type": "keyword"},
+          "scene_id": {"type": "keyword"}
+        }
+      },
+      "ocr": {
+        "properties": {
+          "raw_text": {"type": "text", "analyzer": "vi_text"},
+          "corrected_text": {
+            "type": "text",
+            "analyzer": "vi_text",
+            "fields": {
+              "keyword": {"type": "keyword", "ignore_above": 512},
+              "suggest": {"type": "text", "analyzer": "vi_search_as_you_type"}
+            }
+          },
+          "normalized_text": {"type": "text", "analyzer": "vi_text"},
+          "has_text": {"type": "boolean"},
+          "line_count": {"type": "integer"},
+          "min_confidence": {"type": "float"},
+          "avg_confidence": {"type": "float"},
+          "vlm_corrected": {"type": "boolean"},
+          "vlm_model_ids": {"type": "keyword"},
+          "ocr_engine": {"type": "keyword"},
+          "lines": {
+            "type": "nested",
+            "properties": {
+              "line_id": {"type": "integer"},
+              "group_id": {"type": "integer"},
+              "region_type": {"type": "keyword"},
+              "bbox": {"type": "integer"},
+              "poly": {"type": "integer"},
+              "raw_text": {"type": "text", "analyzer": "vi_text"},
+              "corrected_text": {
+                "type": "text",
+                "analyzer": "vi_text",
+                "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}
+              },
+              "normalized_text": {"type": "text", "analyzer": "vi_text"},
+              "confidence": {"type": "float"},
+              "risk_score": {"type": "float"},
+              "need_vlm": {"type": "boolean"},
+              "vlm_corrected": {"type": "boolean"},
+              "text_changed": {"type": "boolean"}
+            }
+          }
+        }
+      },
+      "quality": {
+        "properties": {
+          "blur_score": {"type": "float"},
+          "brightness": {"type": "float"},
+          "is_duplicate": {"type": "boolean"}
+        }
+      },
+      "created_at": {"type": "date"}
+    }
+  }
+}
