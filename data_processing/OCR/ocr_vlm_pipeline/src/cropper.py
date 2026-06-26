@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .io_utils import ensure_dir
+from .shape_utils import normalize_bbox
 
 
 def crop_group_images(groups, cfg):
@@ -19,7 +20,7 @@ def crop_group_images(groups, cfg):
         try:
             with Image.open(row["frame_path"]) as img:
                 width, height = img.size
-                x1, y1, x2, y2 = row["merged_bbox"]
+                x1, y1, x2, y2 = normalize_bbox(row.get("merged_bbox"))
                 box = (max(0, x1 - padding), max(0, y1 - padding), min(width, x2 + padding), min(height, y2 + padding))
                 crop = img.crop(box)
                 if min(crop.size) < min_side:
@@ -40,4 +41,3 @@ def crop_group_images(groups, cfg):
     import pandas as pd
 
     return pd.DataFrame(rows)
-

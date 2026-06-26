@@ -16,3 +16,26 @@ def test_grouping_keeps_nearby_lines_together():
     assert len(groups) == 1
     assert groups.iloc[0]["line_indices"] == [0, 1]
 
+
+def test_grouping_accepts_numpy_bbox_from_parquet():
+    import numpy as np
+    import pandas as pd
+
+    cfg = to_config({"grouping": {"vertical_gap": 15, "horizontal_gap": 15}, "risk": {"vlm_risk_threshold": 0.45}})
+    df = pd.DataFrame(
+        [
+            {
+                "video_id": "V",
+                "frame_id": "001",
+                "frame_number": 1,
+                "frame_path": "x.jpg",
+                "line_idx": 0,
+                "bbox": np.array([0, 0, 100, 20]),
+                "ocr_text": "A",
+                "confidence": 0.9,
+                "risk_score": 0.5,
+            }
+        ]
+    )
+    groups = group_ocr_lines(df, cfg)
+    assert groups.iloc[0]["merged_bbox"] == [0, 0, 100, 20]

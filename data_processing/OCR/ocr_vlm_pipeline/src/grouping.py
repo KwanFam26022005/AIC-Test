@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from .shape_utils import normalize_bbox, to_plain_list
 
 
 def bbox_union(bboxes: list[list[int]]) -> list[int]:
@@ -10,14 +10,14 @@ def bbox_union(bboxes: list[list[int]]) -> list[int]:
 
 def classify_region(group: dict, image_height: int | None = None) -> str:
     text = (group.get("raw_group_text") or "").strip()
-    bbox = group.get("merged_bbox") or [0, 0, 0, 0]
+    bbox = normalize_bbox(group.get("merged_bbox"))
     if len(text) <= 2:
         return "logo"
     if ":" in text and any(ch.isdigit() for ch in text) and len(text) <= 12:
         return "timestamp"
     if image_height and bbox[1] > image_height * 0.70:
         return "subtitle"
-    if len(group.get("line_indices") or []) >= 5:
+    if len(to_plain_list(group.get("line_indices"), [])) >= 5:
         return "document_block"
     return "scene_text"
 
@@ -32,9 +32,10 @@ def group_ocr_lines(df, cfg):
         current = []
         last_bbox = None
         for row in frame_df.to_dict("records"):
-            bbox = row.get("bbox") or [0, 0, 0, 0]
+            bbox = normalize_bbox(row.get("bbox"))
+            row["bbox"] = bbox
             should_split = False
-            if last_bbox:
+            if last_bbox is not None:
                 vertical_gap = bbox[1] - last_bbox[3]
                 horizontal_gap = abs(bbox[0] - last_bbox[0])
                 should_split = (
@@ -53,7 +54,7 @@ def group_ocr_lines(df, cfg):
 
 
 def _emit_group(frame_id: str, group_id: int, lines: list[dict], cfg) -> dict:
-    bboxes = [line.get("bbox") or [0, 0, 0, 0] for line in lines]
+    bboxes = [normalize_bbox(line.get("bbox")) for line in lines]
     raw_text = "\n".join((line.get("ocr_text") or "").strip() for line in lines)
     group = {
         "video_id": lines[0].get("video_id"),
@@ -81,7 +82,7 @@ def _emit_group(frame_id: str, group_id: int, lines: list[dict], cfg) -> dict:
 def line_to_group_map(groups) -> dict[tuple[str, int], int]:
     mapping = {}
     for row in groups.to_dict("records"):
-        for line_idx in row.get("line_indices") or []:
+        for line_idx in to_plain_list(row.get("line_indices"), []):
             mapping[(row["frame_id"], int(line_idx))] = int(row["group_id"])
     return mapping
 
@@ -89,6 +90,6 @@ def line_to_group_map(groups) -> dict[tuple[str, int], int]:
 def line_to_region_map(groups) -> dict[tuple[str, int], str]:
     mapping = {}
     for row in groups.to_dict("records"):
-        for line_idx in row.get("line_indices") or []:
+        for line_idx in to_plain_list(row.get("line_indices"), []):
             mapping[(row["frame_id"], int(line_idx))] = row.get("region_type", "unknown")
     return mapping

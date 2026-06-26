@@ -7,6 +7,7 @@ import _bootstrap  # noqa: F401
 from src.config import add_config_arg, load_config
 from src.dedup import vlm_cache_key
 from src.io_utils import read_table, write_table
+from src.shape_utils import to_plain_list
 from src.vlm_cache import VLMCache
 from src.vlm_corrector import VLMCorrector
 from src.vlm_prompt import PROMPT_VERSION
@@ -26,7 +27,7 @@ def main() -> None:
     rows = []
     for group in jobs.to_dict("records"):
         model_id = choose_vlm_model(group, cfg)
-        line_indices = [int(x) for x in group["line_indices"]]
+        line_indices = [int(x) for x in to_plain_list(group.get("line_indices"), [])]
         raw_texts = str(group["raw_group_text"]).splitlines()
         raw_lines = [{"line_idx": idx, "raw_text": raw_texts[pos] if pos < len(raw_texts) else ""} for pos, idx in enumerate(line_indices)]
         key = vlm_cache_key(group["raw_group_text"], group.get("crop_phash"), str(group["merged_bbox"]), model_id, PROMPT_VERSION)
@@ -61,4 +62,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .shape_utils import normalize_poly, to_plain_list
+
 
 def _install_modelscope_stub() -> None:
     """Avoid ModelScope importing torch during PaddleOCR import on Colab.
@@ -86,18 +88,20 @@ def normalize_ppocr_result(result) -> list[dict]:
         return []
     item = result[0] if isinstance(result, list) and len(result) == 1 else result
     if isinstance(item, dict):
-        texts = item.get("rec_texts") or item.get("texts") or []
-        scores = item.get("rec_scores") or item.get("scores") or []
-        polys = item.get("rec_polys") or item.get("dt_polys") or item.get("polys") or []
+        texts = _first_present(item, "rec_texts", "texts")
+        scores = _first_present(item, "rec_scores", "scores")
+        polys = _first_present(item, "rec_polys", "dt_polys", "polys")
         rows = []
         for idx, text in enumerate(texts):
-            poly = polys[idx].tolist() if hasattr(polys[idx], "tolist") else polys[idx]
+            poly = normalize_poly(polys[idx]) if idx < len(polys) else []
+            if not poly:
+                continue
             xs = [int(p[0]) for p in poly]
             ys = [int(p[1]) for p in poly]
             rows.append(
                 {
                     "line_idx": idx,
-                    "poly": [[int(p[0]), int(p[1])] for p in poly],
+                    "poly": poly,
                     "bbox": [min(xs), min(ys), max(xs), max(ys)],
                     "ocr_text": str(text),
                     "confidence": float(scores[idx]) if idx < len(scores) else 0.0,
@@ -108,7 +112,17 @@ def normalize_ppocr_result(result) -> list[dict]:
     for idx, line in enumerate(item):
         poly, rec = line
         text, score = rec
+        poly = normalize_poly(poly)
+        if not poly:
+            continue
         xs = [int(p[0]) for p in poly]
         ys = [int(p[1]) for p in poly]
         rows.append({"line_idx": idx, "poly": poly, "bbox": [min(xs), min(ys), max(xs), max(ys)], "ocr_text": text, "confidence": float(score)})
     return rows
+
+
+def _first_present(data: dict, *keys: str) -> list:
+    for key in keys:
+        if key in data and data[key] is not None:
+            return to_plain_list(data[key], [])
+    return []

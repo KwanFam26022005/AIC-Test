@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .io_utils import read_table
+from .shape_utils import normalize_bbox, normalize_poly
 
 
 def build_documents(frame_summary, line_df):
@@ -44,8 +45,8 @@ def _line_doc(row: dict) -> dict:
         "line_id": int(row["line_idx"]),
         "group_id": int(row["group_id"]) if row.get("group_id") is not None else None,
         "region_type": row.get("region_type", "unknown"),
-        "bbox": row.get("bbox") or [],
-        "poly": row.get("poly") or [],
+        "bbox": normalize_bbox(row.get("bbox"), []),
+        "poly": normalize_poly(row.get("poly")),
         "raw_text": row.get("ocr_text") or "",
         "corrected_text": row.get("corrected_text") or row.get("ocr_text") or "",
         "normalized_text": row.get("normalized_text") or "",

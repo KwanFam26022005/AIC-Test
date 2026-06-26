@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from .io_utils import read_table
+from .shape_utils import to_plain_list
 
 
 DEFAULT_BENCHMARK_MODELS = [
@@ -60,7 +61,7 @@ def benchmark_models(cfg, models: list[str], sample_groups: int, output: str | P
 
 
 def _raw_lines_for_group(group: dict) -> list[dict]:
-    line_indices = [int(idx) for idx in group["line_indices"]]
+    line_indices = [int(idx) for idx in to_plain_list(group.get("line_indices"), [])]
     raw_texts = str(group["raw_group_text"]).splitlines()
     return [
         {"line_idx": idx, "raw_text": raw_texts[pos] if pos < len(raw_texts) else ""}
