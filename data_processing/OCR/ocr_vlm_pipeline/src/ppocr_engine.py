@@ -35,6 +35,16 @@ def create_ppocr_engine(cfg):
     if cfg.ppocr.get("stub_modelscope", True):
         _install_modelscope_stub()
 
+    import paddle
+
+    min_version = cfg.ppocr.get("min_paddle_version", "3.3.0")
+    if _version_tuple(paddle.__version__) < _version_tuple(min_version):
+        raise RuntimeError(
+            f"PP-OCRv6 requires PaddlePaddle >= {min_version}; found {paddle.__version__}. "
+            "On Colab, restart the runtime and install paddlepaddle-gpu from the cu126 index "
+            "without pinning to 3.0.0."
+        )
+
     from paddleocr import PaddleOCR
 
     kwargs = {
@@ -48,7 +58,27 @@ def create_ppocr_engine(cfg):
         "text_det_unclip_ratio": float(cfg.ppocr.text_det_unclip_ratio),
         "text_rec_score_thresh": float(cfg.ppocr.text_rec_score_thresh),
     }
-    return PaddleOCR(**kwargs)
+    try:
+        return PaddleOCR(**kwargs)
+    except ValueError as exc:
+        if "Type of attribute: strides is not right" in str(exc):
+            raise RuntimeError(
+                "Paddle failed to create the PP-OCRv6 predictor because the installed "
+                "PaddlePaddle build is incompatible with the downloaded PP-OCRv6 model. "
+                "Restart Colab and reinstall paddlepaddle-gpu from the cu126 index without "
+                "pinning to 3.0.0, then rerun the PP-OCR stage."
+            ) from exc
+        raise
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    parts = []
+    for chunk in version.split("."):
+        digits = "".join(ch for ch in chunk if ch.isdigit())
+        if digits == "":
+            break
+        parts.append(int(digits))
+    return tuple(parts)
 
 
 def normalize_ppocr_result(result) -> list[dict]:

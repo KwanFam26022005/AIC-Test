@@ -17,6 +17,7 @@ dedup:
 ppocr:
   enabled: true
   ocr_version: "PP-OCRv6"
+  min_paddle_version: "3.3.0"
   model_source: "huggingface"
   stub_modelscope: true
   lang: "vi"
