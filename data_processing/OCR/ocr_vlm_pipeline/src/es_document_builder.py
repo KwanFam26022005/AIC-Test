@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .io_utils import read_table
-from .shape_utils import normalize_bbox, normalize_poly
+from .shape_utils import json_safe, normalize_bbox, normalize_poly
 
 
 def build_documents(frame_summary, line_df):
@@ -67,5 +67,5 @@ def run_build_es_documents(cfg) -> Path:
     docs = build_documents(frame_summary, lines)
     with out.open("w", encoding="utf-8") as f:
         for doc in docs:
-            f.write(json.dumps(doc, ensure_ascii=False) + "\n")
+            f.write(json.dumps(json_safe(doc), ensure_ascii=False) + "\n")
     return out

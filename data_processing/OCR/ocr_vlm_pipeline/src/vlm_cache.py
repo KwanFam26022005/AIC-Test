@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 
 from .io_utils import ensure_dir
+from .shape_utils import json_safe
 
 
 class VLMCache:
@@ -36,7 +37,6 @@ class VLMCache:
             INSERT OR REPLACE INTO vlm_cache(cache_key, raw_text, corrected_text, payload_json, model_id, prompt_version)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (cache_key, raw_text, corrected_text, json.dumps(payload, ensure_ascii=False), model_id, prompt_version),
+            (cache_key, raw_text, corrected_text, json.dumps(json_safe(payload), ensure_ascii=False), model_id, prompt_version),
         )
         self.conn.commit()
-

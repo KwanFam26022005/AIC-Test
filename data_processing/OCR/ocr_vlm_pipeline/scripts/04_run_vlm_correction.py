@@ -7,7 +7,7 @@ import _bootstrap  # noqa: F401
 from src.config import add_config_arg, load_config
 from src.dedup import vlm_cache_key
 from src.io_utils import read_table, write_table
-from src.shape_utils import to_plain_list
+from src.shape_utils import json_safe, to_plain_list
 from src.vlm_cache import VLMCache
 from src.vlm_corrector import VLMCorrector
 from src.vlm_prompt import PROMPT_VERSION
@@ -39,7 +39,7 @@ def main() -> None:
             result = correctors[model_id].correct_group(group["crop_path"], raw_lines, group)
             corrected_text = "\n".join(line.get("corrected_text", "") for line in result.get("lines", []))
             if cache:
-                cache.put(key, group["raw_group_text"], corrected_text, result, model_id, PROMPT_VERSION)
+                cache.put(key, group["raw_group_text"], corrected_text, json_safe(result), model_id, PROMPT_VERSION)
             parse_status = result.get("parse_status")
         by_idx = {int(line["line_idx"]): line for line in result.get("lines", [])}
         for raw in raw_lines:

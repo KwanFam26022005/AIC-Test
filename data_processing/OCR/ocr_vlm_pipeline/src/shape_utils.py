@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 
@@ -41,3 +42,33 @@ def normalize_poly(value: Any) -> list[list[int]]:
         if len(coords) >= 2:
             normalized.append([int(float(coords[0])), int(float(coords[1]))])
     return normalized
+
+
+def json_safe(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, "tolist"):
+        return json_safe(value.tolist())
+    if isinstance(value, Path):
+        return str(value)
+    try:
+        import pandas as pd
+
+        if pd.isna(value):
+            return None
+    except (ImportError, TypeError, ValueError):
+        pass
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    try:
+        import numpy as np
+
+        if isinstance(value, np.generic):
+            return value.item()
+    except ImportError:
+        pass
+    return str(value)

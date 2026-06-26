@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Iterable
 
+from .shape_utils import json_safe
+
 
 def ensure_dir(path: str | Path) -> Path:
     path = Path(path)
@@ -43,5 +45,4 @@ def append_jsonl(path: str | Path, rows: Iterable[dict]) -> None:
     ensure_dir(path.parent)
     with path.open("a", encoding="utf-8") as f:
         for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
+            f.write(json.dumps(json_safe(row), ensure_ascii=False) + "\n")
