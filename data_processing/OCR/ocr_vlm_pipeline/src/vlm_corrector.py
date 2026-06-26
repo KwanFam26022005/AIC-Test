@@ -38,12 +38,14 @@ class VLMCorrector:
     def _chat(self, image, prompt: str, n_lines: int) -> str:
         import torch
 
+        do_sample = bool(self.cfg.vlm.do_sample)
         generation_config = {
             "max_new_tokens": max_new_tokens(n_lines, self.cfg),
-            "do_sample": bool(self.cfg.vlm.do_sample),
-            "temperature": float(self.cfg.vlm.temperature),
+            "do_sample": do_sample,
             "num_beams": 1,
         }
+        if do_sample:
+            generation_config["temperature"] = float(self.cfg.vlm.temperature) or 0.7
         if hasattr(self.model, "chat"):
             pixel_values = preprocess_internvl_image(
                 image,
