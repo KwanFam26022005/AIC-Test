@@ -13,6 +13,8 @@ class VLMCorrector:
         self.model_id = model_id
         self.cfg = cfg
         self.model, self.tokenizer = load_transformers_vlm(model_id, cfg)
+        if self.cfg.vlm.get("patch_qwen2_rotary_device", True):
+            patch_qwen2_rotary_device()
 
     def correct_group(self, crop_path: str, raw_lines: list[dict], metadata: dict) -> dict:
         from PIL import Image
@@ -126,3 +128,24 @@ def _best_aspect_ratio(aspect_ratio: float, ratios: list[tuple[int, int]], width
             best_diff = diff
             best_ratio = ratio
     return best_ratio
+
+
+def patch_qwen2_rotary_device() -> None:
+    try:
+        import transformers.models.qwen2.modeling_qwen2 as qwen2
+    except Exception:
+        return
+
+    if getattr(qwen2.apply_rotary_pos_emb, "_ocr_vlm_device_patched", False):
+        return
+
+    original = qwen2.apply_rotary_pos_emb
+
+    def _patched_apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+        if position_ids is not None:
+            cos = cos.to(position_ids.device)
+            sin = sin.to(position_ids.device)
+        return original(q, k, cos, sin, position_ids, unsqueeze_dim=unsqueeze_dim)
+
+    _patched_apply_rotary_pos_emb._ocr_vlm_device_patched = True
+    qwen2.apply_rotary_pos_emb = _patched_apply_rotary_pos_emb

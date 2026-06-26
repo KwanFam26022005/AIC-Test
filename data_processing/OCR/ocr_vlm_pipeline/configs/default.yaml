@@ -62,6 +62,7 @@ vlm:
   attn_implementation: "eager"
   stub_flash_attn: true
   patch_quantized_to: true
+  patch_qwen2_rotary_device: true
   do_sample: false
   temperature: 0.0
   max_new_tokens_base: 64
