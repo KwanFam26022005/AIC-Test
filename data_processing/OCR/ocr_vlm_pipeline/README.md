@@ -17,6 +17,15 @@ Run tests from this directory:
 python -m pytest tests
 ```
 
+After stage 5, summarize and visualize OCR results:
+
+```bash
+python scripts/qa_ocr_results.py --config configs/server_keyframe_test.yaml --frame-id 017
+```
+
+This prints OCR/VLM statistics, writes `qa_summary.json`, and saves an annotated
+frame under `outputs/<video_id>/qa_frames/`.
+
 Benchmark defaults include:
 
 ```text
