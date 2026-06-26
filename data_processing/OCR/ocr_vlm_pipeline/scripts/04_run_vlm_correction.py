@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import _bootstrap  # noqa: F401
+from tqdm.auto import tqdm
 from src.config import add_config_arg, load_config
 from src.dedup import vlm_cache_key
 from src.io_utils import read_table, write_table
@@ -25,7 +27,10 @@ def main() -> None:
     cache = VLMCache(cfg.vlm.cache_path) if cfg.vlm.cache_enabled else None
     correctors = {}
     rows = []
-    for group in jobs.to_dict("records"):
+    job_records = jobs.to_dict("records")
+    print(f"Stage 4 VLM jobs: {len(job_records)}")
+    started = time.perf_counter()
+    for group in tqdm(job_records, total=len(job_records), desc="VLM correction", unit="group"):
         model_id = choose_vlm_model(group, cfg)
         line_indices = [int(x) for x in to_plain_list(group.get("line_indices"), [])]
         raw_texts = str(group["raw_group_text"]).splitlines()
@@ -59,6 +64,8 @@ def main() -> None:
     import pandas as pd
 
     print(write_table(pd.DataFrame(rows), Path(cfg.project.output_dir) / "vlm_corrected.parquet"))
+    elapsed = time.perf_counter() - started
+    print(f"Stage 4 elapsed: {elapsed / 60:.2f} min ({elapsed:.1f} sec)")
 
 
 if __name__ == "__main__":
