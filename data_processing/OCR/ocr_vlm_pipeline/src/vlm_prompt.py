@@ -1,22 +1,37 @@
 from __future__ import annotations
 
-PROMPT_VERSION = "vi_ocr_json_v2"
+import json
+
+PROMPT_VERSION = "vi_ocr_json_v3"
 
 
 def build_prompt(raw_lines: list[dict], short: bool = False) -> str:
-    lines = "\n".join(f"[{line['line_idx']}] {line.get('raw_text') or line.get('ocr_text') or ''}" for line in raw_lines)
+    normalized_lines = [
+        {
+            "line_idx": int(line["line_idx"]),
+            "raw_text": str(line.get("raw_text") or line.get("ocr_text") or ""),
+            "corrected_text": str(line.get("raw_text") or line.get("ocr_text") or ""),
+            "confidence_note": "medium",
+        }
+        for line in raw_lines
+    ]
+    lines = "\n".join(f"[{line['line_idx']}] {line['raw_text']}" for line in normalized_lines)
+    json_template = json.dumps({"lines": normalized_lines}, ensure_ascii=False, separators=(",", ":"))
     if short:
         return (
-            "Sua loi OCR tieng Viet tu anh crop. Chi tra JSON hop le, khong giai thich. "
-            '{"lines":[{"line_idx":0,"raw_text":"...","corrected_text":"...","confidence_note":"low|medium|high"}]}\n'
+            "OCR correction task. Return ONLY valid JSON. Do not describe the image. "
+            "Keep exactly the same line_idx values. Fix Vietnamese OCR text only when visible.\n"
+            f"JSON template to fill:\n{json_template}\n"
             f"Raw OCR lines:\n{lines}"
         )
     return (
-        "Ban la he thong sua loi OCR tieng Viet.\n"
-        "Nhiem vu: dua vao anh crop va danh sach raw OCR ben duoi, sua loi dau, chinh ta va ky tu OCR.\n"
-        "Khong them thong tin moi ngoai noi dung nhin thay trong anh. Giu so dong output bang so dong input.\n"
-        "Chi tra ve JSON hop le theo schema:\n"
-        '{"lines":[{"line_idx":0,"raw_text":"...","corrected_text":"...","confidence_note":"low|medium|high"}]}\n'
+        "You are an OCR text correction engine for Vietnamese video frames.\n"
+        "Use the image crop only to correct the raw OCR lines below.\n"
+        "Return ONLY valid minified JSON. Do not explain. Do not describe the image. Do not use Markdown.\n"
+        "Keep exactly the same number of lines and exactly the same line_idx values.\n"
+        "For each item, keep raw_text unchanged and write the fixed text in corrected_text.\n"
+        "If the text is unreadable or not visible, copy raw_text to corrected_text.\n"
+        f"JSON template to fill:\n{json_template}\n"
         f"Raw OCR lines:\n{lines}"
     )
 

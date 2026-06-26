@@ -28,3 +28,22 @@ def test_parse_python_style_dict():
     result = parse_vlm_json("{'lines': [{'line_idx': 4, 'corrected_text': 'giây',},]}", [4])
     assert result["parse_status"] == "ok"
     assert result["lines"][0]["corrected_text"] == "giây"
+
+
+def test_parse_line_key_dict_from_model():
+    result = parse_vlm_json("{'line_5': 'TÌNH TRẠNG SỤT LÚN ĐBSCL ĐANG DIỄN RA RẤT NHANH'}", [5])
+    assert result["parse_status"] == "ok"
+    assert result["lines"][0]["corrected_text"] == "TÌNH TRẠNG SỤT LÚN ĐBSCL ĐANG DIỄN RA RẤT NHANH"
+
+
+def test_parse_bracket_line_output_from_model():
+    response = "[3] CÁNH BÁO\n[4] SẠT LỞ NGUY HIỂM\n[5] TẠM DỪNG LƯU THÔNG"
+    result = parse_vlm_json(response, [3, 4, 5])
+    assert result["parse_status"] == "ok"
+    assert result["lines"][1]["corrected_text"] == "SẠT LỞ NGUY HIỂM"
+
+
+def test_bracket_number_without_text_is_not_partial():
+    result = parse_vlm_json("[3]", [3])
+    assert result["parse_status"] in ["json_error", "schema_error"]
+    assert result["lines"] == []
