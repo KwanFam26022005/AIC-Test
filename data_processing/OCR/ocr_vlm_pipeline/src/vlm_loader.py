@@ -9,6 +9,46 @@ def _has_flash_attn() -> bool:
         return False
 
 
+def _install_flash_attn_stub() -> None:
+    """Let remote VLM code import flash_attn while using eager attention.
+
+    Some Vintern/InternVL modeling files import flash_attn at module import time
+    even when `attn_implementation="eager"` is requested. Building flash-attn on
+    Colab T4/Python 3.12 is fragile, so this stub satisfies import checks. If a
+    model actually tries to call FlashAttention kernels, the stub raises a clear
+    error instead of silently producing wrong results.
+    """
+    import importlib.machinery
+    import sys
+    import types
+
+    if "flash_attn" in sys.modules:
+        return
+
+    def _unavailable(*args, **kwargs):
+        raise RuntimeError("flash_attn is not installed; set attn_implementation='eager'.")
+
+    flash_attn = types.ModuleType("flash_attn")
+    flash_attn.__spec__ = importlib.machinery.ModuleSpec("flash_attn", loader=None)
+    flash_attn.flash_attn_func = _unavailable
+    flash_attn.flash_attn_varlen_func = _unavailable
+
+    flash_attn_interface = types.ModuleType("flash_attn.flash_attn_interface")
+    flash_attn_interface.__spec__ = importlib.machinery.ModuleSpec("flash_attn.flash_attn_interface", loader=None)
+    flash_attn_interface.flash_attn_func = _unavailable
+    flash_attn_interface.flash_attn_varlen_func = _unavailable
+
+    bert_padding = types.ModuleType("flash_attn.bert_padding")
+    bert_padding.__spec__ = importlib.machinery.ModuleSpec("flash_attn.bert_padding", loader=None)
+    bert_padding.index_first_axis = _unavailable
+    bert_padding.pad_input = _unavailable
+    bert_padding.unpad_input = _unavailable
+
+    sys.modules["flash_attn"] = flash_attn
+    sys.modules["flash_attn.flash_attn_interface"] = flash_attn_interface
+    sys.modules["flash_attn.bert_padding"] = bert_padding
+
+
 def load_transformers_vlm(model_id: str, cfg):
     import torch
     from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
@@ -28,6 +68,8 @@ def load_transformers_vlm(model_id: str, cfg):
     attn_impl = cfg.vlm.get("attn_implementation", None)
     if attn_impl is None:
         attn_impl = "flash_attention_2" if _has_flash_attn() else "eager"
+    if attn_impl == "eager" and cfg.vlm.get("stub_flash_attn", True) and not _has_flash_attn():
+        _install_flash_attn_stub()
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     model = AutoModel.from_pretrained(
@@ -39,4 +81,3 @@ def load_transformers_vlm(model_id: str, cfg):
         attn_implementation=attn_impl,
     ).eval()
     return model, tokenizer
-

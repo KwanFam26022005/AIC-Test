@@ -59,6 +59,8 @@ vlm:
   quantization: "4bit_nf4"
   device: "cuda:0"
   device_map: "auto"
+  attn_implementation: "eager"
+  stub_flash_attn: true
   do_sample: false
   temperature: 0.0
   max_new_tokens_base: 64
