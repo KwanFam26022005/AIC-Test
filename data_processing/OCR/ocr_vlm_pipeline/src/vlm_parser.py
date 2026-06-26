@@ -11,6 +11,9 @@ def parse_vlm_json(text: str, expected_line_indices: list[int]) -> dict:
     try:
         payload = _load_payload(raw)
     except ValueError as exc:
+        parsed = _parse_embedded_line_objects(raw, expected)
+        if parsed:
+            return _result(parsed, expected)
         parsed = _parse_bracket_lines(raw, expected)
         if parsed:
             return _result(parsed, expected)
@@ -20,6 +23,9 @@ def parse_vlm_json(text: str, expected_line_indices: list[int]) -> dict:
     if isinstance(payload, dict) and "line_idx" in payload:
         payload = {"lines": [payload]}
     if not isinstance(payload, dict):
+        parsed = _parse_embedded_line_objects(raw, expected)
+        if parsed:
+            return _result(parsed, expected)
         parsed = _parse_bracket_lines(raw, expected)
         if parsed:
             return _result(parsed, expected)
@@ -29,6 +35,9 @@ def parse_vlm_json(text: str, expected_line_indices: list[int]) -> dict:
         return _result(parsed, expected)
     lines = payload.get("lines")
     if not isinstance(lines, list):
+        parsed = _parse_embedded_line_objects(raw, expected)
+        if parsed:
+            return _result(parsed, expected)
         parsed = _parse_bracket_lines(raw, expected)
         if parsed:
             return _result(parsed, expected)
@@ -49,6 +58,9 @@ def parse_vlm_json(text: str, expected_line_indices: list[int]) -> dict:
             }
         )
     if not parsed:
+        embedded_lines = _parse_embedded_line_objects(raw, expected)
+        if embedded_lines:
+            return _result(embedded_lines, expected)
         bracket_lines = _parse_bracket_lines(raw, expected)
         if bracket_lines:
             return _result(bracket_lines, expected)
@@ -75,6 +87,32 @@ def _parse_line_key_dict(payload: dict, expected: set[int]) -> list[dict]:
     return parsed
 
 
+def _parse_embedded_line_objects(text: str, expected: set[int]) -> list[dict]:
+    parsed = []
+    seen = set()
+    for idx, char in enumerate(text):
+        if char != "{":
+            continue
+        candidate = _extract_balanced(text[idx:], "{", "}")
+        if not candidate:
+            continue
+        normalized = _normalize_candidate(candidate)
+        item = None
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                item = parser(normalized)
+                break
+            except Exception:
+                continue
+        if not isinstance(item, dict) or "line_idx" not in item:
+            continue
+        line = _line_from_item(item, expected)
+        if line and line["line_idx"] not in seen:
+            parsed.append(line)
+            seen.add(line["line_idx"])
+    return parsed
+
+
 def _parse_bracket_lines(text: str, expected: set[int]) -> list[dict]:
     parsed = []
     seen = set()
@@ -86,6 +124,21 @@ def _parse_bracket_lines(text: str, expected: set[int]) -> list[dict]:
         parsed.append({"line_idx": idx, "raw_text": "", "corrected_text": corrected, "confidence_note": "medium"})
         seen.add(idx)
     return parsed
+
+
+def _line_from_item(item: dict, expected: set[int]) -> dict | None:
+    try:
+        idx = int(item["line_idx"])
+    except Exception:
+        return None
+    if idx not in expected:
+        return None
+    return {
+        "line_idx": idx,
+        "raw_text": str(item.get("raw_text") or ""),
+        "corrected_text": str(item.get("corrected_text") or item.get("raw_text") or ""),
+        "confidence_note": str(item.get("confidence_note") or "medium"),
+    }
 
 
 def _load_payload(text: str):

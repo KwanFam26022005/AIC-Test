@@ -65,9 +65,9 @@ vlm:
   patch_qwen2_rotary_device: true
   do_sample: false
   temperature: 0.0
-  max_new_tokens_base: 64
-  max_new_tokens_per_line: 24
-  max_new_tokens_cap: 192
+  max_new_tokens_base: 128
+  max_new_tokens_per_line: 80
+  max_new_tokens_cap: 768
   image_input_size: 448
   image_max_tiles: 6
   batch_size: 1

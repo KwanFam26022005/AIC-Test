@@ -61,7 +61,7 @@ def main() -> None:
                     "vlm_model": model_id,
                     "parse_status": parse_status,
                     "parse_error": result.get("parse_error"),
-                    "raw_response": str(result.get("raw_response") or "")[:1000],
+                    "raw_response": str(result.get("raw_response") or "")[:4000],
                     "cache_key": key,
                 }
             )

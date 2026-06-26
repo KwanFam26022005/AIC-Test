@@ -47,3 +47,16 @@ def test_bracket_number_without_text_is_not_partial():
     result = parse_vlm_json("[3]", [3])
     assert result["parse_status"] in ["json_error", "schema_error"]
     assert result["lines"] == []
+
+
+def test_parse_complete_objects_from_truncated_json_array():
+    response = (
+        '{"lines":['
+        '{"line_idx":3,"raw_text":"CÁNH BÁO","corrected_text":"CÁNH BÁO"},'
+        '{"line_idx":4,"raw_text":"SAT L NGUY HIÊM","corrected_text":"SẠT LỞ NGUY HIỂM"},'
+        '{"line_idx":5,"raw_text":"TAM DÜNG'
+    )
+    result = parse_vlm_json(response, [3, 4, 5])
+    assert result["parse_status"] == "partial"
+    assert len(result["lines"]) == 2
+    assert result["lines"][1]["corrected_text"] == "SẠT LỞ NGUY HIỂM"

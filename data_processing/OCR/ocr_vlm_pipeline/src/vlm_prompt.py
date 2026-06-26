@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-PROMPT_VERSION = "vi_ocr_json_v3"
+PROMPT_VERSION = "vi_ocr_json_v4"
 
 
 def build_prompt(raw_lines: list[dict], short: bool = False) -> str:
@@ -21,6 +21,8 @@ def build_prompt(raw_lines: list[dict], short: bool = False) -> str:
         return (
             "OCR correction task. Return ONLY valid JSON. Do not describe the image. "
             "Keep exactly the same line_idx values. Fix Vietnamese OCR text only when visible.\n"
+            "Examples of OCR fixes: giäy->giây, SAT L->SẠT LỞ, NGUY HIÊM->NGUY HIỂM, "
+            "TAM DÜNG LUU THÔNG->TẠM DỪNG LƯU THÔNG, S训T LÚN->SỤT LÚN.\n"
             f"JSON template to fill:\n{json_template}\n"
             f"Raw OCR lines:\n{lines}"
         )
@@ -31,6 +33,9 @@ def build_prompt(raw_lines: list[dict], short: bool = False) -> str:
         "Keep exactly the same number of lines and exactly the same line_idx values.\n"
         "For each item, keep raw_text unchanged and write the fixed text in corrected_text.\n"
         "If the text is unreadable or not visible, copy raw_text to corrected_text.\n"
+        "Common OCR fixes: giäy->giây, giay->giây, SAT L->SẠT LỞ, NGUY HIÊM->NGUY HIỂM, "
+        "TAM DÜNG LUU THÔNG->TẠM DỪNG LƯU THÔNG, S训T LÚN->SỤT LÚN, "
+        "DANG DIŽN RA RT NHANH->ĐANG DIỄN RA RẤT NHANH.\n"
         f"JSON template to fill:\n{json_template}\n"
         f"Raw OCR lines:\n{lines}"
     )
