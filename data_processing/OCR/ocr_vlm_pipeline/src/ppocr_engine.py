@@ -1,7 +1,40 @@
 from __future__ import annotations
 
 
+def _install_modelscope_stub() -> None:
+    """Avoid ModelScope importing torch during PaddleOCR import on Colab.
+
+    PaddleX imports `modelscope` at module import time even when the selected
+    model source is HuggingFace/BOS. On Colab this can crash before PaddleOCR
+    starts if the runtime has a torch/NCCL mismatch. The OCR stage does not need
+    ModelScope, so a tiny stub is enough and lets PaddleX use other sources.
+    """
+    import sys
+    import types
+
+    if "modelscope" in sys.modules:
+        return
+
+    stub = types.ModuleType("modelscope")
+
+    def _snapshot_download(*args, **kwargs):
+        raise RuntimeError(
+            "ModelScope download is disabled in this OCR runtime. "
+            "Use PADDLE_PDX_MODEL_SOURCE=huggingface or bos."
+        )
+
+    stub.snapshot_download = _snapshot_download
+    sys.modules["modelscope"] = stub
+
+
 def create_ppocr_engine(cfg):
+    import os
+
+    os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", cfg.ppocr.get("model_source", "huggingface"))
+    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+    if cfg.ppocr.get("stub_modelscope", True):
+        _install_modelscope_stub()
+
     from paddleocr import PaddleOCR
 
     kwargs = {
@@ -49,4 +82,3 @@ def normalize_ppocr_result(result) -> list[dict]:
         ys = [int(p[1]) for p in poly]
         rows.append({"line_idx": idx, "poly": poly, "bbox": [min(xs), min(ys), max(xs), max(ys)], "ocr_text": text, "confidence": float(score)})
     return rows
-

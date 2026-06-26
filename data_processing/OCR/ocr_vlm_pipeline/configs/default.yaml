@@ -17,6 +17,8 @@ dedup:
 ppocr:
   enabled: true
   ocr_version: "PP-OCRv6"
+  model_source: "huggingface"
+  stub_modelscope: true
   lang: "vi"
   use_doc_orientation_classify: false
   use_doc_unwarping: false
@@ -72,4 +74,3 @@ es:
   index_name: "video_frames_v1"
   bulk_size: 500
   request_timeout: 120
-
