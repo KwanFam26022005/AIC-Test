@@ -58,7 +58,7 @@ vlm:
   allow_model_switch: true
   quantization: "4bit_nf4"
   device: "cuda:0"
-  device_map: "auto"
+  device_map: "cuda:0"
   attn_implementation: "eager"
   stub_flash_attn: true
   patch_quantized_to: true

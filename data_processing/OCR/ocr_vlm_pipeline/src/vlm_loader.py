@@ -99,6 +99,10 @@ def load_transformers_vlm(model_id: str, cfg):
     if attn_impl == "eager" and cfg.vlm.get("stub_flash_attn", True) and not _has_flash_attn():
         _install_flash_attn_stub()
 
+    device_map = cfg.vlm.get("device_map", "cuda:0")
+    if device_map in ["cuda", "cuda:0"]:
+        device_map = {"": device_map}
+
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     patch_to = bool(quant_config is not None and cfg.vlm.get("patch_quantized_to", True))
     with _no_quantized_model_to_call(patch_to):
@@ -106,7 +110,7 @@ def load_transformers_vlm(model_id: str, cfg):
             model_id,
             trust_remote_code=True,
             quantization_config=quant_config,
-            device_map=cfg.vlm.get("device_map", "auto"),
+            device_map=device_map,
             low_cpu_mem_usage=True,
             attn_implementation=attn_impl,
         ).eval()
