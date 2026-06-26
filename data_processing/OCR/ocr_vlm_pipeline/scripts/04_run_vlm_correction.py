@@ -34,7 +34,8 @@ def main() -> None:
         result = cache.get(key) if cache else None
         parse_status = "cache_hit" if result else None
         if result is None:
-            correctors.setdefault(model_id, VLMCorrector(model_id, cfg))
+            if model_id not in correctors:
+                correctors[model_id] = VLMCorrector(model_id, cfg)
             result = correctors[model_id].correct_group(group["crop_path"], raw_lines, group)
             corrected_text = "\n".join(line.get("corrected_text", "") for line in result.get("lines", []))
             if cache:

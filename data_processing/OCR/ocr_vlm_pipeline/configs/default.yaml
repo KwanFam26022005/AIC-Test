@@ -61,6 +61,7 @@ vlm:
   device_map: "auto"
   attn_implementation: "eager"
   stub_flash_attn: true
+  patch_quantized_to: true
   do_sample: false
   temperature: 0.0
   max_new_tokens_base: 64

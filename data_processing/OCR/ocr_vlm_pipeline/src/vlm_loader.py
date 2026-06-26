@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 
 def _has_flash_attn() -> bool:
     try:
@@ -49,6 +51,32 @@ def _install_flash_attn_stub() -> None:
     sys.modules["flash_attn.bert_padding"] = bert_padding
 
 
+@contextmanager
+def _no_quantized_model_to_call(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    import transformers.modeling_utils
+
+    original_to = transformers.modeling_utils.PreTrainedModel.to
+
+    def _safe_to(self, *args, **kwargs):
+        try:
+            return original_to(self, *args, **kwargs)
+        except ValueError as exc:
+            message = str(exc)
+            if "4-bit" in message or "8-bit" in message or "bitsandbytes" in message:
+                return self
+            raise
+
+    transformers.modeling_utils.PreTrainedModel.to = _safe_to
+    try:
+        yield
+    finally:
+        transformers.modeling_utils.PreTrainedModel.to = original_to
+
+
 def load_transformers_vlm(model_id: str, cfg):
     import torch
     from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
@@ -72,12 +100,14 @@ def load_transformers_vlm(model_id: str, cfg):
         _install_flash_attn_stub()
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
-        model_id,
-        trust_remote_code=True,
-        quantization_config=quant_config,
-        device_map=cfg.vlm.get("device_map", "auto"),
-        low_cpu_mem_usage=True,
-        attn_implementation=attn_impl,
-    ).eval()
+    patch_to = bool(quant_config is not None and cfg.vlm.get("patch_quantized_to", True))
+    with _no_quantized_model_to_call(patch_to):
+        model = AutoModel.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            quantization_config=quant_config,
+            device_map=cfg.vlm.get("device_map", "auto"),
+            low_cpu_mem_usage=True,
+            attn_implementation=attn_impl,
+        ).eval()
     return model, tokenizer
