@@ -7,14 +7,11 @@ from pathlib import Path
 import _bootstrap  # noqa: F401
 from src.config import add_config_arg, load_config
 from src.io_utils import ensure_dir, read_table
-from src.shape_utils import json_safe, normalize_bbox
+from src.shape_utils import json_safe
 
 
 def main() -> None:
-    parser = add_config_arg(argparse.ArgumentParser(description="Summarize OCR/VLM results and visualize one frame."))
-    parser.add_argument("--frame-id", default=None, help="Frame id to visualize, e.g. 017.")
-    parser.add_argument("--frame-number", type=int, default=None, help="Frame number to visualize when frame-id is unknown.")
-    parser.add_argument("--output-image", default=None, help="Where to save the annotated frame image.")
+    parser = add_config_arg(argparse.ArgumentParser(description="Summarize OCR/VLM results after stage 5."))
     parser.add_argument("--summary-json", default=None, help="Where to save summary stats as JSON.")
     parser.add_argument("--top", type=int, default=15, help="Number of example rows to print.")
     args = parser.parse_args()
@@ -40,15 +37,6 @@ def main() -> None:
     summary_json.write_text(json.dumps(json_safe(stats), ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nSaved summary JSON: {summary_json}")
 
-    if args.frame_id is not None or args.frame_number is not None:
-        frame_lines = select_frame_lines(merged, args.frame_id, args.frame_number)
-        if frame_lines.empty:
-            raise SystemExit("No OCR lines found for the requested frame.")
-        output_image = Path(args.output_image) if args.output_image else out_dir / "qa_frames" / f"{frame_lines.iloc[0]['frame_id']}_ocr_overlay.jpg"
-        draw_frame_overlay(frame_lines, output_image)
-        print_frame_table(frame_lines)
-        print(f"\nSaved annotated frame: {output_image}")
-
 
 def build_stats(out_dir: Path, merged, summary) -> dict:
     stats = {
@@ -72,7 +60,14 @@ def build_stats(out_dir: Path, merged, summary) -> dict:
         stats["avg_risk_score"] = float(merged["risk_score"].fillna(0).mean())
         stats["max_risk_score"] = float(merged["risk_score"].fillna(0).max())
 
-    for name in ["frame_registry.parquet", "ppocr_raw.parquet", "ocr_risk.parquet", "ocr_groups.parquet", "vlm_jobs.parquet", "vlm_corrected.parquet"]:
+    for name in [
+        "frame_registry.parquet",
+        "ppocr_raw.parquet",
+        "ocr_risk.parquet",
+        "ocr_groups.parquet",
+        "vlm_jobs.parquet",
+        "vlm_corrected.parquet",
+    ]:
         path = out_dir / name
         if path.exists():
             try:
@@ -103,7 +98,21 @@ def print_examples(merged, top: int) -> None:
 
     pd.set_option("display.max_columns", None)
     pd.set_option("display.width", 1400)
-    cols = [col for col in ["frame_id", "line_idx", "ocr_text", "corrected_text", "confidence", "risk_score", "vlm_corrected", "text_changed", "parse_status"] if col in merged.columns]
+    cols = [
+        col
+        for col in [
+            "frame_id",
+            "line_idx",
+            "ocr_text",
+            "corrected_text",
+            "confidence",
+            "risk_score",
+            "vlm_corrected",
+            "text_changed",
+            "parse_status",
+        ]
+        if col in merged.columns
+    ]
     if "text_changed" in merged:
         changed = merged[merged["text_changed"].fillna(False)]
         if len(changed):
@@ -112,45 +121,6 @@ def print_examples(merged, top: int) -> None:
     if "confidence" in merged and len(merged):
         print("\n=== Lowest Confidence Lines ===")
         print(merged.nsmallest(min(top, len(merged)), "confidence")[cols].to_string(index=False))
-
-
-def select_frame_lines(merged, frame_id: str | None, frame_number: int | None):
-    if frame_id is not None:
-        return merged[merged["frame_id"].astype(str) == str(frame_id)].copy()
-    return merged[merged["frame_number"].astype(int) == int(frame_number)].copy()
-
-
-def draw_frame_overlay(frame_lines, output_image: Path) -> None:
-    from PIL import Image, ImageDraw, ImageFont
-
-    frame_path = Path(str(frame_lines.iloc[0]["frame_path"]))
-    if not frame_path.exists():
-        raise SystemExit(f"Frame image does not exist: {frame_path}")
-
-    image = Image.open(frame_path).convert("RGB")
-    draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default()
-
-    for row in frame_lines.sort_values("line_idx").to_dict("records"):
-        bbox = normalize_bbox(row.get("bbox"))
-        changed = bool(row.get("text_changed"))
-        vlm_corrected = bool(row.get("vlm_corrected"))
-        color = (0, 200, 80) if changed else (0, 130, 255) if vlm_corrected else (255, 170, 0)
-        draw.rectangle(bbox, outline=color, width=3)
-        label = f"{int(row['line_idx'])}: {row.get('corrected_text') or row.get('ocr_text') or ''}"
-        label = label[:90]
-        text_bbox = draw.textbbox((bbox[0], max(0, bbox[1] - 16)), label, font=font)
-        draw.rectangle(text_bbox, fill=(0, 0, 0))
-        draw.text((bbox[0], max(0, bbox[1] - 16)), label, fill=(255, 255, 255), font=font)
-
-    ensure_dir(output_image.parent)
-    image.save(output_image, quality=95)
-
-
-def print_frame_table(frame_lines) -> None:
-    cols = [col for col in ["frame_id", "frame_number", "line_idx", "ocr_text", "corrected_text", "confidence", "vlm_corrected", "text_changed", "bbox"] if col in frame_lines.columns]
-    print("\n=== Requested Frame Lines ===")
-    print(frame_lines.sort_values("line_idx")[cols].to_string(index=False))
 
 
 def _value_counts(series) -> dict:

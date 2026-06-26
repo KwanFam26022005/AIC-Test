@@ -17,14 +17,21 @@ Run tests from this directory:
 python -m pytest tests
 ```
 
-After stage 5, summarize and visualize OCR results:
+After stage 5, summarize OCR results:
 
 ```bash
-python scripts/qa_ocr_results.py --config configs/server_keyframe_test.yaml --frame-id 017
+python scripts/qa_ocr_stats.py --config configs/server_keyframe_test.yaml
 ```
 
-This prints OCR/VLM statistics, writes `qa_summary.json`, and saves an annotated
-frame under `outputs/<video_id>/qa_frames/`.
+This prints OCR/VLM statistics and writes `qa_summary.json`.
+
+Visualize one frame as `PP-OCRv6 detect -> crop -> final`:
+
+```bash
+python scripts/visualize_ocr_frame.py --config configs/server_keyframe_test.yaml --frame-id 017
+```
+
+This saves a three-panel image under `outputs/<video_id>/qa_frames/`.
 
 Benchmark defaults include:
 
