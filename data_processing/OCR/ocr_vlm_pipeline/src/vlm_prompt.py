@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-PROMPT_VERSION = "vi_ocr_json_v1"
+PROMPT_VERSION = "vi_ocr_json_v2"
 
 
 def build_prompt(raw_lines: list[dict], short: bool = False) -> str:
@@ -26,4 +26,3 @@ def max_new_tokens(n_lines: int, cfg) -> int:
         int(cfg.vlm.max_new_tokens_cap),
         int(cfg.vlm.max_new_tokens_base) + int(n_lines) * int(cfg.vlm.max_new_tokens_per_line),
     )
-

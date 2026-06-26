@@ -37,6 +37,8 @@ def main() -> None:
         raw_lines = [{"line_idx": idx, "raw_text": raw_texts[pos] if pos < len(raw_texts) else ""} for pos, idx in enumerate(line_indices)]
         key = vlm_cache_key(group["raw_group_text"], group.get("crop_phash"), str(group["merged_bbox"]), model_id, PROMPT_VERSION)
         result = cache.get(key) if cache else None
+        if result and result.get("parse_status") not in ["ok", "partial"]:
+            result = None
         parse_status = "cache_hit" if result else None
         if result is None:
             if model_id not in correctors:
@@ -58,6 +60,8 @@ def main() -> None:
                     "corrected_text": fixed.get("corrected_text") or raw["raw_text"],
                     "vlm_model": model_id,
                     "parse_status": parse_status,
+                    "parse_error": result.get("parse_error"),
+                    "raw_response": str(result.get("raw_response") or "")[:1000],
                     "cache_key": key,
                 }
             )
