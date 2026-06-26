@@ -49,13 +49,12 @@ grouping:
 vlm:
   enabled: true
   provider: "huggingface_transformers"
-  model_id: "5CD-AI/Vintern-3B-beta"
+  model_id: "5CD-AI/Vintern-3B-R-beta"
   alternative_model_id: "5CD-AI/Vintern-3B-R-beta"
   benchmark_model_ids:
-    - "5CD-AI/Vintern-3B-beta"
     - "5CD-AI/Vintern-3B-R-beta"
     - "erax-ai/EraX-VL-2B-V1.5"
-  allow_model_switch: true
+  allow_model_switch: false
   quantization: "4bit_nf4"
   device: "cuda:0"
   device_map: "cuda:0"

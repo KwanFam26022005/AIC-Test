@@ -20,7 +20,6 @@ python -m pytest tests
 Benchmark defaults include:
 
 ```text
-5CD-AI/Vintern-3B-beta
 5CD-AI/Vintern-3B-R-beta
 erax-ai/EraX-VL-2B-V1.5
 ```
