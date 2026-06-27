@@ -1,5 +1,5 @@
 from src.config import to_config
-from src.grouping import group_ocr_lines
+from src.grouping import classify_region, group_ocr_lines
 
 
 def _grouping_cfg(**overrides):
@@ -83,6 +83,99 @@ def test_grouping_links_overlapping_boxes_by_iou():
     groups = group_ocr_lines(df, cfg)
     assert len(groups) == 1
     assert groups.iloc[0]["merged_bbox"] == [10, 10, 110, 60]
+
+
+def test_classify_region_uses_broadcast_overlay_geometry():
+    image_width = 1280
+    image_height = 720
+
+    assert classify_region(
+        {"raw_group_text": "BBo", "merged_bbox": [281, 26, 457, 136], "line_indices": [0]},
+        image_width=image_width,
+        image_height=image_height,
+    ) == "logo"
+    assert classify_region(
+        {"raw_group_text": "HTV9D\nHD\n06:50:05", "merged_bbox": [1039, 48, 1179, 115], "line_indices": [1, 2, 3]},
+        image_width=image_width,
+        image_height=image_height,
+    ) == "timestamp"
+    assert classify_region(
+        {
+            "raw_group_text": "DAN MACH: KHUYEN KHICH DU KHACH\nTHAM GIA LAM SACH MOI TRUONG",
+            "merged_bbox": [386, 581, 1238, 694],
+            "line_indices": [5, 7],
+        },
+        image_width=image_width,
+        image_height=image_height,
+    ) == "lower_third"
+
+
+def test_lower_third_groups_are_sent_to_vlm_but_channel_overlays_are_not():
+    import pandas as pd
+
+    cfg = _grouping_cfg()
+    df = pd.DataFrame(
+        [
+            {
+                "video_id": "V",
+                "frame_id": "236",
+                "frame_number": 236,
+                "frame_path": "x.jpg",
+                "width": 1280,
+                "height": 720,
+                "line_idx": 0,
+                "bbox": [281, 26, 457, 136],
+                "ocr_text": "BBo",
+                "confidence": 0.49,
+                "risk_score": 0.45,
+            },
+            {
+                "video_id": "V",
+                "frame_id": "236",
+                "frame_number": 236,
+                "frame_path": "x.jpg",
+                "width": 1280,
+                "height": 720,
+                "line_idx": 1,
+                "bbox": [1039, 48, 1179, 115],
+                "ocr_text": "06:50:05",
+                "confidence": 0.99,
+                "risk_score": 0.0,
+            },
+            {
+                "video_id": "V",
+                "frame_id": "236",
+                "frame_number": 236,
+                "frame_path": "x.jpg",
+                "width": 1280,
+                "height": 720,
+                "line_idx": 2,
+                "bbox": [386, 581, 1238, 612],
+                "ocr_text": "DAN MACH: KHUYEN KHICH DU KHACH",
+                "confidence": 0.99,
+                "risk_score": 0.0,
+            },
+            {
+                "video_id": "V",
+                "frame_id": "236",
+                "frame_number": 236,
+                "frame_path": "x.jpg",
+                "width": 1280,
+                "height": 720,
+                "line_idx": 3,
+                "bbox": [386, 622, 1238, 650],
+                "ocr_text": "THAM GIA LAM SACH MOI TRUONG",
+                "confidence": 0.99,
+                "risk_score": 0.0,
+            },
+        ]
+    )
+
+    groups = group_ocr_lines(df, cfg)
+    by_region = {row["region_type"]: row for row in groups.to_dict("records")}
+    assert not by_region["logo"]["need_vlm_group"]
+    assert not by_region["timestamp"]["need_vlm_group"]
+    assert by_region["lower_third"]["need_vlm_group"]
 
 
 def test_grouping_on_requested_frame_from_parquet():

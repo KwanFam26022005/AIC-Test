@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import re
+
 from .shape_utils import normalize_bbox, to_plain_list
+
+
+TIME_RE = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
+CHANNEL_RE = re.compile(r"\b(?:HTV|VTV|THVL|VTC|ANTV|QPVN|VOV|TV|HD|LIVE)\w*\b", re.IGNORECASE)
 
 
 def bbox_union(bboxes: list[list[int]]) -> list[int]:
@@ -41,17 +47,32 @@ def axis_gap(a: list[int], b: list[int], axis: str) -> int:
     return max(0, max(a[1], b[1]) - min(a[3], b[3]))
 
 
-def classify_region(group: dict, image_height: int | None = None) -> str:
+def classify_region(group: dict, image_width: int | None = None, image_height: int | None = None) -> str:
     text = (group.get("raw_group_text") or "").strip()
+    compact_text = re.sub(r"\s+", "", text)
     bbox = normalize_bbox(group.get("merged_bbox"))
-    if len(text) <= 2:
-        return "logo"
-    if ":" in text and any(ch.isdigit() for ch in text) and len(text) <= 12:
+    line_count = len(to_plain_list(group.get("line_indices"), []))
+    box_width = max(1, bbox[2] - bbox[0])
+    box_height = max(1, bbox[3] - bbox[1])
+    width_ratio = box_width / max(1, image_width or box_width)
+    height_ratio = box_height / max(1, image_height or box_height)
+    y1_ratio = bbox[1] / max(1, image_height or bbox[3] or 1)
+    y2_ratio = bbox[3] / max(1, image_height or bbox[3] or 1)
+    in_top_band = bool(image_height and y2_ratio <= 0.22)
+    in_lower_band = bool(image_height and y1_ratio >= 0.62)
+
+    if TIME_RE.search(text) and (in_top_band or len(compact_text) <= 24):
         return "timestamp"
-    if image_height and bbox[1] > image_height * 0.70:
-        return "subtitle"
-    if len(to_plain_list(group.get("line_indices"), [])) >= 5:
+    if in_top_band and CHANNEL_RE.search(text):
+        return "channel_logo"
+    if len(compact_text) <= 2 or (in_top_band and len(compact_text) <= 4 and width_ratio <= 0.25 and height_ratio <= 0.22):
+        return "logo"
+    if line_count >= 5:
         return "document_block"
+    if in_lower_band and (line_count >= 2 or width_ratio >= 0.35):
+        return "lower_third"
+    if image_height and y1_ratio >= 0.72:
+        return "subtitle"
     return "scene_text"
 
 
@@ -64,9 +85,39 @@ def group_ocr_lines(df, cfg):
         for row in frame_df.to_dict("records"):
             row["bbox"] = normalize_bbox(row.get("bbox"))
             frame_rows.append(row)
+        image_width, image_height = _frame_size(frame_rows)
         for group_id, component in enumerate(_spatial_components(frame_rows, cfg)):
-            rows.append(_emit_group(frame_id, group_id, component, cfg))
+            rows.append(_emit_group(frame_id, group_id, component, cfg, image_width, image_height))
     return pd.DataFrame(rows)
+
+
+def _frame_size(rows: list[dict]) -> tuple[int | None, int | None]:
+    if not rows:
+        return None, None
+    first = rows[0]
+    width = _positive_int(first.get("width"))
+    height = _positive_int(first.get("height"))
+    if width and height:
+        return width, height
+
+    frame_path = first.get("frame_path")
+    if not frame_path:
+        return None, None
+    try:
+        from PIL import Image
+
+        with Image.open(frame_path) as img:
+            return img.size
+    except Exception:
+        return None, None
+
+
+def _positive_int(value) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def _spatial_components(rows: list[dict], cfg) -> list[list[dict]]:
@@ -130,7 +181,7 @@ def _component_sort_key(rows: list[dict]) -> tuple[int, int, int]:
     return (bbox[1], bbox[0], first_idx)
 
 
-def _emit_group(frame_id: str, group_id: int, lines: list[dict], cfg) -> dict:
+def _emit_group(frame_id: str, group_id: int, lines: list[dict], cfg, image_width: int | None = None, image_height: int | None = None) -> dict:
     bboxes = [normalize_bbox(line.get("bbox")) for line in lines]
     raw_text = "\n".join((line.get("ocr_text") or "").strip() for line in lines)
     group = {
@@ -148,11 +199,13 @@ def _emit_group(frame_id: str, group_id: int, lines: list[dict], cfg) -> dict:
         "avg_confidence": sum(float(line.get("confidence") or 0.0) for line in lines) / max(1, len(lines)),
         "max_risk_score": max(float(line.get("risk_score") or 0.0) for line in lines),
     }
-    group["region_type"] = classify_region(group)
+    group["region_type"] = classify_region(group, image_width=image_width, image_height=image_height)
+    vlm_region_types = {"signboard", "complex_signboard", "document_block", "table", "lower_third", "subtitle"}
+    excluded_region_types = {"timestamp", "logo", "channel_logo"}
     group["need_vlm_group"] = (
         group["max_risk_score"] >= float(cfg.risk.vlm_risk_threshold)
-        or group["region_type"] in ["signboard", "document_block", "table"]
-    ) and group["region_type"] not in ["timestamp", "logo"]
+        or group["region_type"] in vlm_region_types
+    ) and group["region_type"] not in excluded_region_types
     return group
 
 
