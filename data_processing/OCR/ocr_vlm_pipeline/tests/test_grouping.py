@@ -95,6 +95,7 @@ def test_grouping_on_requested_frame_from_parquet():
 
     Optional:
         OCR_GROUPING_INPUT=outputs/L21_V001/ocr_risk.parquet
+        OCR_GROUPING_CROP_DIR=outputs/L21_V001/debug_grouping_crops/frame_017
     """
     import os
     from pathlib import Path
@@ -132,3 +133,61 @@ def test_grouping_on_requested_frame_from_parquet():
     print(f"\nFrame rows: {len(frame_df)}")
     print(f"Groups: {len(groups)}")
     print(groups[["frame_id", "group_id", "line_indices", "merged_bbox", "raw_group_text", "need_vlm_group", "region_type"]].to_string(index=False))
+
+    crop_index = _save_debug_group_crops(groups, cfg)
+    print(f"\nDebug crops: {crop_index['crop_dir']}")
+    print(crop_index["rows"][["group_id", "line_indices", "need_vlm_group", "merged_bbox", "crop_box", "crop_path"]].to_string(index=False))
+
+
+def _save_debug_group_crops(groups, cfg):
+    import json
+    import os
+    from pathlib import Path
+
+    import pandas as pd
+    from PIL import Image
+
+    from src.io_utils import ensure_dir
+    from src.shape_utils import json_safe, normalize_bbox
+
+    frame_id = str(groups.iloc[0]["frame_id"])
+    crop_dir_env = os.environ.get("OCR_GROUPING_CROP_DIR")
+    if crop_dir_env:
+        crop_dir = ensure_dir(crop_dir_env)
+    else:
+        crop_dir = ensure_dir(Path(cfg.project.output_dir) / "debug_grouping_crops" / f"frame_{frame_id}")
+
+    padding = int(cfg.grouping.get("crop_padding", 20))
+    rows = []
+    for row in groups.to_dict("records"):
+        frame_path = Path(str(row["frame_path"]))
+        if not frame_path.exists():
+            frame_path = Path.cwd() / frame_path
+        if not frame_path.exists():
+            rows.append({
+                **row,
+                "crop_box": None,
+                "crop_path": None,
+                "crop_size": None,
+                "crop_error": f"missing frame image: {row['frame_path']}",
+            })
+            continue
+
+        with Image.open(frame_path) as img:
+            width, height = img.size
+            x1, y1, x2, y2 = normalize_bbox(row.get("merged_bbox"))
+            crop_box = [
+                max(0, x1 - padding),
+                max(0, y1 - padding),
+                min(width, x2 + padding),
+                min(height, y2 + padding),
+            ]
+            crop = img.crop(tuple(crop_box))
+            crop_path = crop_dir / f"{frame_id}_g{int(row['group_id']):03d}.jpg"
+            crop.save(crop_path, quality=95)
+            rows.append({**row, "crop_box": crop_box, "crop_path": str(crop_path), "crop_size": list(crop.size)})
+
+    index_df = pd.DataFrame(rows)
+    index_path = crop_dir / "crops_index.json"
+    index_path.write_text(json.dumps(json_safe(rows), ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"crop_dir": crop_dir, "index_path": index_path, "rows": index_df}
