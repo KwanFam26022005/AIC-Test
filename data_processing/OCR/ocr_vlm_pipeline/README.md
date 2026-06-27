@@ -11,6 +11,11 @@ python scripts/05_merge_features.py --config configs/colab_demo.yaml
 python scripts/06_build_es_documents.py --config configs/colab_demo.yaml
 ```
 
+OCR lines are grouped before VLM correction using spatial connected components:
+boxes are linked when they overlap by IoU, are stacked vertically with enough
+horizontal overlap, or sit on the same text row with a small horizontal gap. Each
+VLM crop is the union of all linked boxes plus `grouping.crop_padding`.
+
 Run tests from this directory:
 
 ```bash

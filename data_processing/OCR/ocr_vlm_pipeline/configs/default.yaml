@@ -42,6 +42,9 @@ risk:
 grouping:
   vertical_gap: 15
   horizontal_gap: 15
+  iou_threshold: 0.05
+  min_horizontal_overlap: 0.25
+  min_vertical_overlap: 0.25
   crop_padding: 20
   min_crop_side: 64
   max_crop_side: 1024

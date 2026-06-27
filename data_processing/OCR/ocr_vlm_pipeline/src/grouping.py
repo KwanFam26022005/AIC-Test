@@ -8,6 +8,39 @@ def bbox_union(bboxes: list[list[int]]) -> list[int]:
     return [min(xs1), min(ys1), max(xs2), max(ys2)]
 
 
+def bbox_iou(a: list[int], b: list[int]) -> float:
+    ix1 = max(a[0], b[0])
+    iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2])
+    iy2 = min(a[3], b[3])
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+    return inter / max(1, area_a + area_b - inter)
+
+
+def axis_overlap_ratio(a: list[int], b: list[int], axis: str) -> float:
+    if axis == "x":
+        left = max(a[0], b[0])
+        right = min(a[2], b[2])
+        denom = min(max(1, a[2] - a[0]), max(1, b[2] - b[0]))
+    else:
+        left = max(a[1], b[1])
+        right = min(a[3], b[3])
+        denom = min(max(1, a[3] - a[1]), max(1, b[3] - b[1]))
+    return max(0, right - left) / denom
+
+
+def axis_gap(a: list[int], b: list[int], axis: str) -> int:
+    if axis == "x":
+        return max(0, max(a[0], b[0]) - min(a[2], b[2]))
+    return max(0, max(a[1], b[1]) - min(a[3], b[3]))
+
+
 def classify_region(group: dict, image_height: int | None = None) -> str:
     text = (group.get("raw_group_text") or "").strip()
     bbox = normalize_bbox(group.get("merged_bbox"))
@@ -27,30 +60,74 @@ def group_ocr_lines(df, cfg):
 
     rows = []
     for frame_id, frame_df in df.groupby("frame_id", sort=False):
-        frame_df = frame_df.sort_values(["frame_number", "line_idx"])
-        group_id = 0
-        current = []
-        last_bbox = None
+        frame_rows = []
         for row in frame_df.to_dict("records"):
-            bbox = normalize_bbox(row.get("bbox"))
-            row["bbox"] = bbox
-            should_split = False
-            if last_bbox is not None:
-                vertical_gap = bbox[1] - last_bbox[3]
-                horizontal_gap = abs(bbox[0] - last_bbox[0])
-                should_split = (
-                    vertical_gap > int(cfg.grouping.vertical_gap)
-                    or horizontal_gap > max(int(cfg.grouping.horizontal_gap), (last_bbox[2] - last_bbox[0]) * 2)
-                )
-            if should_split and current:
-                rows.append(_emit_group(frame_id, group_id, current, cfg))
-                group_id += 1
-                current = []
-            current.append(row)
-            last_bbox = bbox
-        if current:
-            rows.append(_emit_group(frame_id, group_id, current, cfg))
+            row["bbox"] = normalize_bbox(row.get("bbox"))
+            frame_rows.append(row)
+        for group_id, component in enumerate(_spatial_components(frame_rows, cfg)):
+            rows.append(_emit_group(frame_id, group_id, component, cfg))
     return pd.DataFrame(rows)
+
+
+def _spatial_components(rows: list[dict], cfg) -> list[list[dict]]:
+    if not rows:
+        return []
+    parent = list(range(len(rows)))
+
+    def find(idx: int) -> int:
+        while parent[idx] != idx:
+            parent[idx] = parent[parent[idx]]
+            idx = parent[idx]
+        return idx
+
+    def union(a: int, b: int) -> None:
+        root_a = find(a)
+        root_b = find(b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            if _should_link_boxes(rows[i]["bbox"], rows[j]["bbox"], cfg):
+                union(i, j)
+
+    components: dict[int, list[dict]] = {}
+    for idx, row in enumerate(rows):
+        components.setdefault(find(idx), []).append(row)
+
+    grouped = []
+    for component in components.values():
+        grouped.append(sorted(component, key=_line_sort_key))
+    return sorted(grouped, key=_component_sort_key)
+
+
+def _should_link_boxes(a: list[int], b: list[int], cfg) -> bool:
+    vertical_gap = int(cfg.grouping.get("vertical_gap", 15))
+    horizontal_gap = int(cfg.grouping.get("horizontal_gap", 15))
+    iou_threshold = float(cfg.grouping.get("iou_threshold", 0.05))
+    min_horizontal_overlap = float(cfg.grouping.get("min_horizontal_overlap", 0.25))
+    min_vertical_overlap = float(cfg.grouping.get("min_vertical_overlap", 0.25))
+
+    if bbox_iou(a, b) >= iou_threshold:
+        return True
+
+    stacked_vertically = axis_gap(a, b, "y") <= vertical_gap and axis_overlap_ratio(a, b, "x") >= min_horizontal_overlap
+    if stacked_vertically:
+        return True
+
+    same_text_row = axis_gap(a, b, "x") <= horizontal_gap and axis_overlap_ratio(a, b, "y") >= min_vertical_overlap
+    return same_text_row
+
+
+def _line_sort_key(row: dict) -> tuple[int, int, int]:
+    bbox = normalize_bbox(row.get("bbox"))
+    return (bbox[1], bbox[0], int(row.get("line_idx", 0)))
+
+
+def _component_sort_key(rows: list[dict]) -> tuple[int, int, int]:
+    bbox = bbox_union([normalize_bbox(row.get("bbox")) for row in rows])
+    first_idx = min(int(row.get("line_idx", 0)) for row in rows)
+    return (bbox[1], bbox[0], first_idx)
 
 
 def _emit_group(frame_id: str, group_id: int, lines: list[dict], cfg) -> dict:
