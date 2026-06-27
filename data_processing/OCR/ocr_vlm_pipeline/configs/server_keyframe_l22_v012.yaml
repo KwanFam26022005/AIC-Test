@@ -15,7 +15,7 @@ runtime:
 vlm:
   device: "cuda:0"
   device_map: "cuda:0"
-  batch_size: 2
+  batch_size: 4
   cache_path: "./outputs/L22_V012/vlm_cache.sqlite"
 
 es:
