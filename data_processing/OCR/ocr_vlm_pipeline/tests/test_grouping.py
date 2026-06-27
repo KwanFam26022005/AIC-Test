@@ -9,6 +9,10 @@ def _grouping_cfg(**overrides):
         "iou_threshold": 0.05,
         "min_horizontal_overlap": 0.25,
         "min_vertical_overlap": 0.25,
+        "lower_third_y_start_ratio": 0.55,
+        "lower_third_horizontal_gap": 180,
+        "lower_third_vertical_gap": 50,
+        "lower_third_min_vertical_overlap": 0.12,
     }
     grouping.update(overrides)
     return to_config({"grouping": grouping, "risk": {"vlm_risk_threshold": 0.45}})
@@ -176,6 +180,76 @@ def test_lower_third_groups_are_sent_to_vlm_but_channel_overlays_are_not():
     assert not by_region["logo"]["need_vlm_group"]
     assert not by_region["timestamp"]["need_vlm_group"]
     assert by_region["lower_third"]["need_vlm_group"]
+
+
+def test_lower_third_side_by_side_blocks_are_merged_before_crop():
+    import pandas as pd
+
+    cfg = _grouping_cfg()
+    df = pd.DataFrame(
+        [
+            {
+                "video_id": "V",
+                "frame_id": "236",
+                "frame_number": 236,
+                "frame_path": "x.jpg",
+                "width": 1280,
+                "height": 720,
+                "line_idx": 5,
+                "bbox": [386, 581, 1238, 612],
+                "ocr_text": "DAN MACH: KHUYEN KHICH DU KHACH",
+                "confidence": 0.99,
+                "risk_score": 0.0,
+            },
+            {
+                "video_id": "V",
+                "frame_id": "236",
+                "frame_number": 236,
+                "frame_path": "x.jpg",
+                "width": 1280,
+                "height": 720,
+                "line_idx": 6,
+                "bbox": [0, 606, 266, 642],
+                "ocr_text": "giay",
+                "confidence": 0.88,
+                "risk_score": 0.2,
+            },
+            {
+                "video_id": "V",
+                "frame_id": "236",
+                "frame_number": 236,
+                "frame_path": "x.jpg",
+                "width": 1280,
+                "height": 720,
+                "line_idx": 7,
+                "bbox": [386, 622, 1238, 650],
+                "ocr_text": "THAM GIA LAM SACH MOI TRUONG",
+                "confidence": 0.99,
+                "risk_score": 0.0,
+            },
+            {
+                "video_id": "V",
+                "frame_id": "236",
+                "frame_number": 236,
+                "frame_path": "x.jpg",
+                "width": 1280,
+                "height": 720,
+                "line_idx": 8,
+                "bbox": [0, 656, 266, 692],
+                "ocr_text": "n xe chay qua toc do",
+                "confidence": 0.88,
+                "risk_score": 0.2,
+            },
+        ]
+    )
+
+    groups = group_ocr_lines(df, cfg)
+    assert len(groups) == 1
+    group = groups.iloc[0]
+    assert group["region_type"] == "lower_third"
+    assert group["need_vlm_group"]
+    assert group["line_indices"] == [5, 6, 7, 8]
+    assert group["merged_bbox"] == [0, 581, 1238, 692]
 
 
 def test_grouping_on_requested_frame_from_parquet():

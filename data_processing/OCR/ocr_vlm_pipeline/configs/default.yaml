@@ -45,6 +45,10 @@ grouping:
   iou_threshold: 0.05
   min_horizontal_overlap: 0.25
   min_vertical_overlap: 0.25
+  lower_third_y_start_ratio: 0.55
+  lower_third_horizontal_gap: 180
+  lower_third_vertical_gap: 50
+  lower_third_min_vertical_overlap: 0.12
   crop_padding: 20
   min_crop_side: 64
   max_crop_side: 1024

@@ -86,7 +86,7 @@ def group_ocr_lines(df, cfg):
             row["bbox"] = normalize_bbox(row.get("bbox"))
             frame_rows.append(row)
         image_width, image_height = _frame_size(frame_rows)
-        for group_id, component in enumerate(_spatial_components(frame_rows, cfg)):
+        for group_id, component in enumerate(_spatial_components(frame_rows, cfg, image_width, image_height)):
             rows.append(_emit_group(frame_id, group_id, component, cfg, image_width, image_height))
     return pd.DataFrame(rows)
 
@@ -120,7 +120,7 @@ def _positive_int(value) -> int | None:
     return number if number > 0 else None
 
 
-def _spatial_components(rows: list[dict], cfg) -> list[list[dict]]:
+def _spatial_components(rows: list[dict], cfg, image_width: int | None = None, image_height: int | None = None) -> list[list[dict]]:
     if not rows:
         return []
     parent = list(range(len(rows)))
@@ -139,7 +139,7 @@ def _spatial_components(rows: list[dict], cfg) -> list[list[dict]]:
 
     for i in range(len(rows)):
         for j in range(i + 1, len(rows)):
-            if _should_link_boxes(rows[i]["bbox"], rows[j]["bbox"], cfg):
+            if _should_link_boxes(rows[i]["bbox"], rows[j]["bbox"], cfg, image_width, image_height):
                 union(i, j)
 
     components: dict[int, list[dict]] = {}
@@ -152,7 +152,7 @@ def _spatial_components(rows: list[dict], cfg) -> list[list[dict]]:
     return sorted(grouped, key=_component_sort_key)
 
 
-def _should_link_boxes(a: list[int], b: list[int], cfg) -> bool:
+def _should_link_boxes(a: list[int], b: list[int], cfg, image_width: int | None = None, image_height: int | None = None) -> bool:
     vertical_gap = int(cfg.grouping.get("vertical_gap", 15))
     horizontal_gap = int(cfg.grouping.get("horizontal_gap", 15))
     iou_threshold = float(cfg.grouping.get("iou_threshold", 0.05))
@@ -167,7 +167,27 @@ def _should_link_boxes(a: list[int], b: list[int], cfg) -> bool:
         return True
 
     same_text_row = axis_gap(a, b, "x") <= horizontal_gap and axis_overlap_ratio(a, b, "y") >= min_vertical_overlap
-    return same_text_row
+    if same_text_row:
+        return True
+
+    return _should_link_lower_third_boxes(a, b, cfg, image_width, image_height)
+
+
+def _should_link_lower_third_boxes(a: list[int], b: list[int], cfg, image_width: int | None, image_height: int | None) -> bool:
+    if not image_width or not image_height:
+        return False
+
+    y_start_ratio = float(cfg.grouping.get("lower_third_y_start_ratio", 0.55))
+    if a[1] / image_height < y_start_ratio or b[1] / image_height < y_start_ratio:
+        return False
+
+    max_horizontal_gap = int(cfg.grouping.get("lower_third_horizontal_gap", max(180, image_width * 0.15)))
+    max_vertical_gap = int(cfg.grouping.get("lower_third_vertical_gap", max(45, image_height * 0.07)))
+    min_vertical_overlap = float(cfg.grouping.get("lower_third_min_vertical_overlap", 0.12))
+
+    horizontally_close = axis_gap(a, b, "x") <= max_horizontal_gap
+    vertically_related = axis_gap(a, b, "y") <= max_vertical_gap or axis_overlap_ratio(a, b, "y") >= min_vertical_overlap
+    return horizontally_close and vertically_related
 
 
 def _line_sort_key(row: dict) -> tuple[int, int, int]:
