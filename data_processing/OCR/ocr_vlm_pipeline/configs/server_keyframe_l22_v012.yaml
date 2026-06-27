@@ -1,0 +1,22 @@
+extends: default.yaml
+
+project:
+  video_id: "L22_V012"
+  frames_dir: "../../../keyframe_test/L22_V012"
+  output_dir: "./outputs/L22_V012"
+  resume: true
+
+runtime:
+  device: "cuda:0"
+  num_workers_io: 8
+  save_every_n_frames: 100
+  log_every_n_frames: 25
+
+vlm:
+  device: "cuda:0"
+  device_map: "cuda:0"
+  batch_size: 1
+  cache_path: "./outputs/L22_V012/vlm_cache.sqlite"
+
+es:
+  index_name: "video_frames_l22_v012_test"
