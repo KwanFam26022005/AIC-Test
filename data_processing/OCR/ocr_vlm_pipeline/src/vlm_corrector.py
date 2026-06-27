@@ -13,6 +13,7 @@ class VLMCorrector:
         self.model_id = model_id
         self.cfg = cfg
         self.model, self.tokenizer = load_transformers_vlm(model_id, cfg)
+        self._batch_chat_available = hasattr(self.model, "batch_chat")
         if self.cfg.vlm.get("patch_qwen2_rotary_device", True):
             patch_qwen2_rotary_device()
 
@@ -37,17 +38,49 @@ class VLMCorrector:
         )
         return parsed
 
+    def correct_batch(self, items: list[dict]) -> list[dict]:
+        if len(items) <= 1 or not self._batch_chat_available:
+            return [self.correct_group(item["crop_path"], item["raw_lines"], item["metadata"]) for item in items]
+
+        from PIL import Image
+
+        images = [Image.open(Path(item["crop_path"])).convert("RGB") for item in items]
+        prompts = [build_prompt(item["raw_lines"]) for item in items]
+        line_counts = [len(item["raw_lines"]) for item in items]
+        start = time.perf_counter()
+        try:
+            responses = self._chat_batch(images, prompts, max(line_counts, default=1))
+        except Exception:
+            self._batch_chat_available = False
+            print(f"batch_chat failed for {self.model_id}; falling back to sequential chat.")
+            return [self.correct_group(item["crop_path"], item["raw_lines"], item["metadata"]) for item in items]
+        if isinstance(responses, str) or len(responses) != len(items):
+            self._batch_chat_available = False
+            print(f"batch_chat returned unexpected output for {self.model_id}; falling back to sequential chat.")
+            return [self.correct_group(item["crop_path"], item["raw_lines"], item["metadata"]) for item in items]
+
+        results = []
+        for item, image, response in zip(items, images, responses):
+            raw_lines = item["raw_lines"]
+            parsed = parse_vlm_json(response, [line["line_idx"] for line in raw_lines])
+            if parsed["parse_status"] not in ["ok", "partial"]:
+                response = self._chat(image, build_prompt(raw_lines, short=True), len(raw_lines))
+                parsed = parse_vlm_json(response, [line["line_idx"] for line in raw_lines])
+            parsed.update(
+                {
+                    "model_id": self.model_id,
+                    "latency_sec": time.perf_counter() - start,
+                    "raw_response": response,
+                    "metadata": item["metadata"],
+                }
+            )
+            results.append(parsed)
+        return results
+
     def _chat(self, image, prompt: str, n_lines: int) -> str:
         import torch
 
-        do_sample = bool(self.cfg.vlm.do_sample)
-        generation_config = {
-            "max_new_tokens": max_new_tokens(n_lines, self.cfg),
-            "do_sample": do_sample,
-            "num_beams": 1,
-        }
-        if do_sample:
-            generation_config["temperature"] = float(self.cfg.vlm.temperature) or 0.7
+        generation_config = self._generation_config(n_lines)
         if hasattr(self.model, "chat"):
             pixel_values = preprocess_internvl_image(
                 image,
@@ -60,6 +93,42 @@ class VLMCorrector:
             with torch.no_grad():
                 return self.model.chat(self.tokenizer, pixel_values, prompt, generation_config=generation_config)
         raise RuntimeError(f"Model {self.model_id} does not expose a chat() API; add adapter in vlm_corrector.py")
+
+    def _chat_batch(self, images, prompts: list[str], max_lines: int) -> list[str]:
+        import torch
+
+        pixel_batches = [
+            preprocess_internvl_image(
+                image,
+                input_size=int(self.cfg.vlm.get("image_input_size", 448)),
+                max_num=int(self.cfg.vlm.get("image_max_tiles", 6)),
+            )
+            for image in images
+        ]
+        num_patches_list = [len(pixel_values) for pixel_values in pixel_batches]
+        pixel_values = torch.cat(pixel_batches, dim=0)
+        dtype = next(self.model.parameters()).dtype
+        device = getattr(self.model, "device", None) or next(self.model.parameters()).device
+        pixel_values = pixel_values.to(dtype=dtype, device=device)
+        with torch.no_grad():
+            return self.model.batch_chat(
+                self.tokenizer,
+                pixel_values,
+                num_patches_list=num_patches_list,
+                questions=prompts,
+                generation_config=self._generation_config(max_lines),
+            )
+
+    def _generation_config(self, n_lines: int) -> dict:
+        do_sample = bool(self.cfg.vlm.do_sample)
+        generation_config = {
+            "max_new_tokens": max_new_tokens(n_lines, self.cfg),
+            "do_sample": do_sample,
+            "num_beams": 1,
+        }
+        if do_sample:
+            generation_config["temperature"] = float(self.cfg.vlm.temperature) or 0.7
+        return generation_config
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
