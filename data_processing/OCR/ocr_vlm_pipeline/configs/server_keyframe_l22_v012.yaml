@@ -7,14 +7,14 @@ project:
   resume: true
 
 runtime:
-  device: "cuda:0"
+  device: "cuda:7"
   num_workers_io: 8
   save_every_n_frames: 100
   log_every_n_frames: 25
 
 vlm:
-  device: "cuda:0"
-  device_map: "cuda:0"
+  device: "cuda:7"
+  device_map: "cuda:7"
   attn_implementation: "flash_attention_2"
   stub_flash_attn: false
   batch_size: 6
