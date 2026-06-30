@@ -15,7 +15,9 @@ runtime:
 vlm:
   device: "cuda:0"
   device_map: "cuda:0"
-  batch_size: 4
+  attn_implementation: "flash_attention_2"
+  stub_flash_attn: false
+  batch_size: 6
   cache_path: "./outputs/L22_V012/vlm_cache.sqlite"
 
 es:
