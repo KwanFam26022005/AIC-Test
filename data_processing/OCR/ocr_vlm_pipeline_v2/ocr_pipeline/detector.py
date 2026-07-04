@@ -20,7 +20,9 @@ logger = logging.getLogger(__name__)
 
 def _get_paddle_device(cfg: dict) -> str:
     """Determine Paddle device from config or auto-detect."""
-    device = cfg.get("paddle_device")
+    import os
+
+    device = os.environ.get("OCR_V2_PADDLE_DEVICE") or cfg.get("paddle_device")
     if device:
         return device
     try:
@@ -49,6 +51,24 @@ def create_detector(cfg: dict):
     logger.info(f"Creating PP-OCRv6 detector on device={device}")
 
     try:
+        from paddleocr import TextDetection
+
+        return TextDetection(
+            model_name=cfg["det_model_name"],
+            device=device,
+            engine="paddle_static",
+            limit_side_len=cfg["det_limit_side_len"],
+            limit_type=cfg["det_limit_type"],
+            thresh=cfg["det_thresh"],
+            box_thresh=cfg["det_box_thresh"],
+            unclip_ratio=cfg["det_unclip_ratio"],
+            enable_mkldnn=False,
+            cpu_threads=4,
+        )
+    except (ImportError, AttributeError) as exc:
+        logger.info(f"PaddleOCR TextDetection unavailable ({exc}); trying paddlex.TextDetection.")
+
+    try:
         from paddlex import TextDetection
 
         return TextDetection(
@@ -64,7 +84,12 @@ def create_detector(cfg: dict):
             cpu_threads=4,
         )
     except (ImportError, AttributeError) as exc:
-        logger.info(f"PaddleX TextDetection unavailable ({exc}); trying paddlex.create_model.")
+        logger.info(f"PaddleX TextDetection unavailable ({exc}); trying PaddleOCR end-to-end detector.")
+
+    try:
+        return _PaddleOCRDetector(cfg)
+    except Exception as exc:
+        logger.info(f"PaddleOCR end-to-end detector unavailable ({exc}); trying paddlex.create_model.")
 
     try:
         from paddlex import create_model
@@ -287,7 +312,17 @@ def detect_lines(detector, img_rgb: np.ndarray, cfg: dict) -> tuple[list[dict], 
     t0 = time.time()
 
     # TextDetection expects file path or numpy array
-    det_output = detector.predict(img_rgb)
+    try:
+        det_output = detector.predict(img_rgb)
+    except OSError as exc:
+        if _looks_like_gpu_runtime_error(exc) and _get_paddle_device(cfg) != "cpu":
+            logger.warning(f"GPU detector failed ({exc}); retrying detection on CPU.")
+            cpu_cfg = dict(cfg)
+            cpu_cfg["paddle_device"] = "cpu"
+            detector = create_detector(cpu_cfg)
+            det_output = detector.predict(img_rgb)
+        else:
+            raise
     det_time = time.time() - t0
 
     boxes, det_scores = parse_text_detection_output(det_output)
@@ -311,3 +346,8 @@ def detect_lines(detector, img_rgb: np.ndarray, cfg: dict) -> tuple[list[dict], 
 
     logger.info(f"After filtering: {len(line_items)} valid lines (dropped {len(boxes) - len(line_items)})")
     return line_items, det_time
+
+
+def _looks_like_gpu_runtime_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "cudnn" in message or "cuda" in message or "gpu" in message
