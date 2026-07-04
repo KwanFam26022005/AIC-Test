@@ -1,0 +1,32 @@
+# OCR VLM Pipeline v2 — Dependencies
+# Tested with Python 3.10+
+
+# ── PaddleOCR (detection) ────────────────────────────────────────────
+paddleocr
+paddlepaddle  # or paddlepaddle-gpu for GPU
+
+# ── VietOCR (line recognition) ──────────────────────────────────────
+vietocr
+
+# ── Vintern / Transformers (VLM fallback) ───────────────────────────
+transformers==4.45.2
+accelerate==0.34.2
+tokenizers==0.20.3
+bitsandbytes  # for 4bit quantization
+
+# ── Core ML ──────────────────────────────────────────────────────────
+torch
+torchvision
+timm
+einops
+
+# ── Image processing ─────────────────────────────────────────────────
+pillow
+opencv-python-headless
+
+# ── Data / IO ─────────────────────────────────────────────────────────
+pandas
+numpy
+matplotlib
+tqdm
+pyyaml
