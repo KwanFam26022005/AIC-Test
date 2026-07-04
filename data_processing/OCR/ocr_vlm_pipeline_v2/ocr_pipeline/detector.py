@@ -34,6 +34,13 @@ def _get_paddle_device(cfg: dict) -> str:
     return "cpu"
 
 
+def _get_paddle_engine(cfg: dict) -> str:
+    """Determine PaddleOCR inference engine."""
+    import os
+
+    return os.environ.get("OCR_V2_PADDLE_ENGINE") or cfg.get("paddle_engine") or "paddle_static"
+
+
 def create_detector(cfg: dict):
     """Create a PP-OCRv6 text detector.
 
@@ -48,7 +55,8 @@ def create_detector(cfg: dict):
     _install_modelscope_stub()
 
     device = _get_paddle_device(cfg)
-    logger.info(f"Creating PP-OCRv6 detector on device={device}")
+    engine = _get_paddle_engine(cfg)
+    logger.info(f"Creating PP-OCRv6 detector on device={device}, engine={engine}")
 
     try:
         from paddleocr import TextDetection
@@ -56,7 +64,7 @@ def create_detector(cfg: dict):
         return TextDetection(
             model_name=cfg["det_model_name"],
             device=device,
-            engine="paddle_static",
+            engine=engine,
             limit_side_len=cfg["det_limit_side_len"],
             limit_type=cfg["det_limit_type"],
             thresh=cfg["det_thresh"],
@@ -74,7 +82,7 @@ def create_detector(cfg: dict):
         return TextDetection(
             model_name=cfg["det_model_name"],
             device=device,
-            engine="paddle_static",
+            engine=engine,
             limit_side_len=cfg["det_limit_side_len"],
             limit_type=cfg["det_limit_type"],
             thresh=cfg["det_thresh"],

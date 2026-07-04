@@ -25,6 +25,7 @@ def get_default_config() -> dict:
         "det_box_thresh": 0.50,
         "det_unclip_ratio": 1.8,
         "paddle_device": None,  # auto-detect: gpu:0 if available, else cpu
+        "paddle_engine": "paddle_static",  # override with OCR_V2_PADDLE_ENGINE
 
         # ── Line box filtering ─────────────────────────────────────────
         "drop_low_det_score_below": 0.0,
