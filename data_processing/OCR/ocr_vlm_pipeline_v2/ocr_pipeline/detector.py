@@ -1,8 +1,8 @@
 """
-PP-OCRv6 Text Detection via PaddleX TextDetection API.
+PP-OCRv6 Text Detection via PaddleX/PaddleOCR APIs.
 
 Handles:
-- Creating the TextDetection detector
+- Creating the text detector across PaddleX versions
 - Parsing various output formats (dt_polys, rec_polys, boxes, etc.)
 - Filtering boxes by size/aspect ratio/det_score
 """
@@ -33,10 +33,10 @@ def _get_paddle_device(cfg: dict) -> str:
 
 
 def create_detector(cfg: dict):
-    """Create a PaddleX TextDetection instance.
+    """Create a PP-OCRv6 text detector.
 
     Returns:
-        TextDetection model object
+        Detector model object with a predict(image) method.
     """
     import os
     os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "huggingface")
@@ -45,24 +45,82 @@ def create_detector(cfg: dict):
     # Stub modelscope to avoid import issues
     _install_modelscope_stub()
 
-    from paddlex import TextDetection
-
     device = _get_paddle_device(cfg)
-    logger.info(f"Creating TextDetection detector on device={device}")
+    logger.info(f"Creating PP-OCRv6 detector on device={device}")
 
-    detector = TextDetection(
-        model_name=cfg["det_model_name"],
-        device=device,
-        engine="paddle_static",
-        limit_side_len=cfg["det_limit_side_len"],
-        limit_type=cfg["det_limit_type"],
-        thresh=cfg["det_thresh"],
-        box_thresh=cfg["det_box_thresh"],
-        unclip_ratio=cfg["det_unclip_ratio"],
-        enable_mkldnn=False,
-        cpu_threads=4,
-    )
-    return detector
+    try:
+        from paddlex import TextDetection
+
+        return TextDetection(
+            model_name=cfg["det_model_name"],
+            device=device,
+            engine="paddle_static",
+            limit_side_len=cfg["det_limit_side_len"],
+            limit_type=cfg["det_limit_type"],
+            thresh=cfg["det_thresh"],
+            box_thresh=cfg["det_box_thresh"],
+            unclip_ratio=cfg["det_unclip_ratio"],
+            enable_mkldnn=False,
+            cpu_threads=4,
+        )
+    except (ImportError, AttributeError) as exc:
+        logger.info(f"PaddleX TextDetection unavailable ({exc}); trying paddlex.create_model.")
+
+    try:
+        from paddlex import create_model
+
+        model = create_model(model_name=cfg["det_model_name"])
+        return _PaddleXCreateModelDetector(model)
+    except Exception as exc:
+        logger.info(f"paddlex.create_model detector unavailable ({exc}); falling back to PaddleOCR.")
+
+    return _PaddleOCRDetector(cfg)
+
+
+class _PaddleXCreateModelDetector:
+    """Adapter for PaddleX 3.x create_model() detection models."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def predict(self, img_rgb: np.ndarray):
+        try:
+            result = self.model.predict(input=img_rgb, batch_size=1)
+        except TypeError:
+            result = self.model.predict(img_rgb)
+        return _materialize_prediction(result)
+
+
+class _PaddleOCRDetector:
+    """Adapter using PaddleOCR 3.x end-to-end OCR output as detection source."""
+
+    def __init__(self, cfg: dict):
+        from paddleocr import PaddleOCR
+
+        self.engine = PaddleOCR(
+            ocr_version="PP-OCRv6",
+            lang="vi",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            text_det_limit_side_len=cfg["det_limit_side_len"],
+            text_det_thresh=cfg["det_thresh"],
+            text_det_box_thresh=cfg["det_box_thresh"],
+            text_det_unclip_ratio=cfg["det_unclip_ratio"],
+            text_rec_score_thresh=0.0,
+        )
+
+    def predict(self, img_rgb: np.ndarray):
+        return _materialize_prediction(self.engine.predict(img_rgb))
+
+
+def _materialize_prediction(result):
+    if isinstance(result, (list, tuple, dict)):
+        return result
+    try:
+        return list(result)
+    except TypeError:
+        return result
 
 
 def _install_modelscope_stub() -> None:
@@ -105,6 +163,18 @@ def parse_text_detection_output(det_output) -> tuple[list[np.ndarray], list[floa
         # If it's a list of results, take the first
         elif hasattr(data[0], '__getitem__') and not isinstance(data[0], np.ndarray):
             data = data[0]
+
+    if hasattr(data, "json"):
+        try:
+            data = data.json
+        except Exception:
+            try:
+                data = data.json()
+            except Exception:
+                pass
+
+    if isinstance(data, dict) and "res" in data and isinstance(data["res"], dict):
+        data = data["res"]
 
     # Extract polygons
     polys = None
