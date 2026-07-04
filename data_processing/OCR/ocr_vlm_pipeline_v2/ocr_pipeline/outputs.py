@@ -216,8 +216,6 @@ def export_es_document(
     timing: dict | None = None,
 ) -> str:
     """Export ES-compatible JSON document."""
-    from ..scoring.wordlist import load_wordlist
-
     frame_id = Path(image_path).stem
 
     doc = {
