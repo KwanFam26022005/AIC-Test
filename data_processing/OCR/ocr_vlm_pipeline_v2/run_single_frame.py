@@ -36,11 +36,6 @@ from ocr_pipeline.recognizers.vietocr_recognizer import (
     create_vietocr_predictor,
     recognize_all_lines,
 )
-from ocr_pipeline.recognizers.vintern_recognizer import (
-    load_vintern_model,
-    run_vintern_line_fallback,
-    run_vintern_group_fallback,
-)
 from ocr_pipeline.scoring.wordlist import load_wordlist
 from ocr_pipeline.scoring.gating import score_and_gate_line, detect_rec_conf_flat
 from ocr_pipeline.outputs import (
@@ -191,6 +186,12 @@ def run_ocr_pipeline(
     vintern_group_time = 0.0
 
     if cfg.get("use_vintern_line_fallback", True) or cfg.get("use_vintern_group_fallback", True):
+        from ocr_pipeline.recognizers.vintern_recognizer import (
+            load_vintern_model,
+            run_vintern_group_fallback,
+            run_vintern_line_fallback,
+        )
+
         logger.info("Loading Vintern model...")
         vintern_model, vintern_tokenizer = load_vintern_model(cfg)
 
