@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -216,27 +219,7 @@ def export_es_document(
     timing: dict | None = None,
 ) -> str:
     """Export ES-compatible JSON document."""
-    frame_id = Path(image_path).stem
-
-    doc = {
-        "frame_id": frame_id,
-        "image_path": str(image_path),
-        "ocr_pipeline": {
-            "detector": cfg.get("det_model_name", "PP-OCRv6_medium_det"),
-            "line_recognizer": f"VietOCR/{cfg.get('vietocr_config', 'vgg_transformer')}",
-            "fallback_vlm_line": cfg.get("vintern_model_id", "5CD-AI/Vintern-1B-v3_5"),
-            "fallback_vlm_group": cfg.get("vintern_model_id", "5CD-AI/Vintern-1B-v3_5"),
-            "wordlist_enabled": True,
-            "group_text_rule": "group_text_clean only; group_text_review is not indexed",
-        },
-        "timing": timing or {},
-        "ocr_text_clean": clean_text,
-        "ocr_text_review": review_text,
-        "ocr_group_texts_clean": [g.get("group_text_clean", "") for g in groups],
-        "ocr_group_texts_review": [g.get("group_text_review", "") for g in groups],
-        "ocr_lines": _serialize_lines(line_items),
-        "ocr_groups": _serialize_groups(groups),
-    }
+    doc = build_es_document(line_items, groups, clean_text, review_text, cfg, image_path, timing)
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -246,27 +229,127 @@ def export_es_document(
     return str(path)
 
 
+def build_es_document(
+    line_items: list[dict],
+    groups: list[dict],
+    clean_text: str,
+    review_text: str,
+    cfg: dict,
+    image_path: str,
+    timing: dict | None = None,
+) -> dict:
+    """Build an ES-friendly frame OCR document.
+
+    The top-level search fields are intentionally denormalized:
+    - ocr_text_search: clean + review text for broad recall
+    - ocr_text_unaccent: accent-stripped search helper for Vietnamese fuzzy search
+    - ocr_terms: normalized unique tokens for lazy autocomplete/filtering
+
+    Line/group arrays keep evidence for UI inspection and debugging.
+    """
+    image = Path(image_path)
+    frame_id = Path(image_path).stem
+    frame_number = _parse_frame_number(frame_id)
+    video_id = image.parent.name
+
+    clean_text = (clean_text or "").strip()
+    review_text = (review_text or "").strip()
+    line_texts = [
+        (line.get("final_text") or line.get("vietocr_text") or "").strip()
+        for line in line_items
+        if (line.get("final_text") or line.get("vietocr_text") or "").strip()
+    ]
+    group_texts = [
+        text.strip()
+        for group in groups
+        for text in (group.get("group_text_clean"), group.get("group_text_review"))
+        if isinstance(text, str) and text.strip()
+    ]
+    search_text = _normalize_space("\n".join([clean_text, review_text, *group_texts, *line_texts]))
+    search_unaccent = _strip_accents(search_text)
+    terms = _extract_terms(search_unaccent)
+
+    quality = {
+        "lines_detected": len(line_items),
+        "groups_formed": len(groups),
+        "clean_chars": len(clean_text),
+        "review_chars": len(review_text),
+        "num_keep_lines": sum(1 for line in line_items if line.get("keep_for_index")),
+        "num_review_lines": sum(1 for line in line_items if line.get("need_review")),
+        "num_vintern_lines": sum(1 for line in line_items if line.get("vintern_text")),
+        "num_vlm_candidates": sum(1 for line in line_items if line.get("send_to_vintern")),
+        "gating_stats": _count_values(line.get("filter_status", "unknown") for line in line_items),
+        "final_source_stats": _count_values(line.get("final_source", "unknown") for line in line_items),
+    }
+
+    doc = {
+        "schema_version": "ocr_vlm_pipeline_v2_es_1",
+        "document_id": f"{video_id}:{frame_id}",
+        "video_id": video_id,
+        "frame_id": frame_id,
+        "frame_number": frame_number,
+        "image_path": str(image_path),
+        "media": {
+            "video_id": video_id,
+            "frame_id": frame_id,
+            "frame_number": frame_number,
+            "image_path": str(image_path),
+        },
+        "ocr_pipeline": {
+            "detector": cfg.get("det_model_name", "PP-OCRv6_medium_det"),
+            "detector_device": os.environ.get("OCR_V2_PADDLE_DEVICE") or cfg.get("paddle_device"),
+            "detector_engine": os.environ.get("OCR_V2_PADDLE_ENGINE") or cfg.get("paddle_engine", "paddle_static"),
+            "line_recognizer": f"VietOCR/{cfg.get('vietocr_config', 'vgg_transformer')}",
+            "fallback_vlm_line": cfg.get("vintern_model_id", "5CD-AI/Vintern-1B-v3_5"),
+            "fallback_vlm_group": cfg.get("vintern_model_id", "5CD-AI/Vintern-1B-v3_5"),
+            "wordlist_enabled": True,
+            "group_text_rule": "group_text_clean only; group_text_review is not indexed",
+        },
+        "timing": timing or {},
+        "quality": quality,
+        "ocr_text_clean": clean_text,
+        "ocr_text_review": review_text,
+        "ocr_text_search": search_text,
+        "ocr_text_unaccent": search_unaccent,
+        "ocr_terms": terms,
+        "ocr_group_texts_clean": [g.get("group_text_clean", "") for g in groups],
+        "ocr_group_texts_review": [g.get("group_text_review", "") for g in groups],
+        "ocr_lines": _serialize_lines(line_items),
+        "ocr_groups": _serialize_groups(groups),
+    }
+    return _safe_json_value(doc)
+
+
+def export_es_jsonl(docs: list[dict], output_path: str | Path) -> str:
+    """Export one JSON document per line for ES bulk preparation."""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for doc in docs:
+            f.write(json.dumps(_safe_json_value(doc), ensure_ascii=False))
+            f.write("\n")
+    logger.info(f"Exported ES JSONL: {path} ({len(docs)} docs)")
+    return str(path)
+
+
 def _serialize_lines(line_items: list[dict]) -> list[dict]:
     """Serialize line items for JSON export."""
     safe_keys = [
         "line_id", "group_id", "vietocr_text", "rec_conf", "rec_conf_source",
         "det_score", "composite_score", "quality_score", "lex_ratio",
-        "diacritic_susp", "charset_penalty", "repetition_penalty",
+        "diacritic_susp", "diacritic_suspicious_tokens", "oov_tokens",
+        "charset_penalty", "repetition_penalty", "priority",
         "filter_status", "send_to_vintern", "vintern_text",
         "vintern_composite_score", "agreement_similarity",
         "final_text", "final_source", "keep_for_index", "need_review",
-        "bbox_xyxy",
+        "bbox_xyxy", "persp_crop_path", "group_crop_path",
     ]
     result = []
     for line in line_items:
         entry = {}
         for key in safe_keys:
             val = line.get(key)
-            if isinstance(val, np.generic):
-                val = val.item()
-            elif isinstance(val, np.ndarray):
-                val = val.tolist()
-            entry[key] = val
+            entry[key] = _safe_json_value(val)
         result.append(entry)
     return result
 
@@ -277,22 +360,73 @@ def _serialize_groups(groups: list[dict]) -> list[dict]:
         "group_id", "reading_order", "num_lines", "line_indices",
         "group_text_clean", "group_text_review", "group_text",
         "group_vintern_text", "group_vintern_composite_score",
-        "group_final_source", "group_keep_for_index", "need_review",
-        "bbox_xyxy", "mean_det_score", "mean_composite_score",
-        "num_keep_lines", "num_vlm_candidates",
+        "group_vintern_agreement_similarity", "group_final_source",
+        "group_keep_for_index", "need_review", "bbox_xyxy",
+        "group_crop_path", "mean_det_score", "mean_composite_score",
+        "mean_rec_conf", "num_keep_lines", "num_filtered_lines",
+        "num_vlm_candidates", "num_vintern_lines", "group_vlm_priority",
     ]
     result = []
     for group in groups:
         entry = {}
         for key in safe_keys:
             val = group.get(key)
-            if isinstance(val, np.generic):
-                val = val.item()
-            elif isinstance(val, np.ndarray):
-                val = val.tolist()
-            entry[key] = val
+            entry[key] = _safe_json_value(val)
         result.append(entry)
     return result
+
+
+def _parse_frame_number(frame_id: str) -> int | None:
+    try:
+        return int(frame_id)
+    except ValueError:
+        match = re.search(r"(\d+)$", frame_id)
+        return int(match.group(1)) if match else None
+
+
+def _normalize_space(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _strip_accents(text: str) -> str:
+    normalized = unicodedata.normalize("NFD", text or "")
+    without_marks = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    return _normalize_space(without_marks.casefold())
+
+
+def _extract_terms(text: str, max_terms: int = 512) -> list[str]:
+    terms = []
+    seen = set()
+    for term in re.findall(r"[\w]+", text or "", flags=re.UNICODE):
+        if len(term) < 2 or term in seen:
+            continue
+        seen.add(term)
+        terms.append(term)
+        if len(terms) >= max_terms:
+            break
+    return terms
+
+
+def _count_values(values) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        key = str(value)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _safe_json_value(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _safe_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_safe_json_value(v) for v in value]
+    return value
 
 
 # ── Text export ──────────────────────────────────────────────────────

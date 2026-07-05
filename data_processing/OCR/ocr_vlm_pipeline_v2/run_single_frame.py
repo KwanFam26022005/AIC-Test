@@ -56,6 +56,7 @@ def run_ocr_pipeline(
     image_path: str,
     cfg: dict | None = None,
     output_dir: str | None = None,
+    context: dict | None = None,
 ) -> dict:
     """Run the full OCR pipeline on a single frame.
 
@@ -73,6 +74,7 @@ def run_ocr_pipeline(
         cfg = make_config()
     if output_dir:
         cfg["output_dir"] = output_dir
+    context = context or {}
 
     frame_id = Path(image_path).stem
     out_dir = Path(cfg["output_dir"])
@@ -85,34 +87,46 @@ def run_ocr_pipeline(
     # ══════════════════════════════════════════════════════════════════
     # 1. Load image
     # ══════════════════════════════════════════════════════════════════
+    image_load_start = time.time()
     logger.info(f"Loading image: {image_path}")
     img_bgr = cv2.imread(str(image_path))
     if img_bgr is None:
         raise FileNotFoundError(f"Cannot read image: {image_path}")
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     H, W = img_rgb.shape[:2]
+    image_load_time = time.time() - image_load_start
     logger.info(f"Image size: {W}x{H}")
 
     # ══════════════════════════════════════════════════════════════════
     # 2. Load wordlist
     # ══════════════════════════════════════════════════════════════════
-    logger.info("Loading wordlist...")
-    wordset, base_to_variants, wordlist_enabled = load_wordlist(
-        cfg.get("wordlist_paths", []),
-        cfg.get("wordlist_min_entries_to_enable", 1000),
-    )
+    wordlist_start = time.time()
+    if "wordlist" in context:
+        wordset, base_to_variants, wordlist_enabled = context["wordlist"]
+    else:
+        logger.info("Loading wordlist...")
+        wordset, base_to_variants, wordlist_enabled = load_wordlist(
+            cfg.get("wordlist_paths", []),
+            cfg.get("wordlist_min_entries_to_enable", 1000),
+        )
+    wordlist_time = time.time() - wordlist_start
 
     # ══════════════════════════════════════════════════════════════════
     # 3. Text detection
     # ══════════════════════════════════════════════════════════════════
     logger.info("Running PP-OCRv6 detection...")
-    detector = create_detector(cfg)
+    detector_init_start = time.time()
+    detector = context.get("detector")
+    if detector is None:
+        detector = create_detector(cfg)
+    detector_init_time = time.time() - detector_init_start
     line_items, det_time = detect_lines(detector, img_rgb, cfg)
     logger.info(f"Detected {len(line_items)} valid lines in {det_time:.3f}s")
 
     # ══════════════════════════════════════════════════════════════════
     # 4. Perspective crop each line
     # ══════════════════════════════════════════════════════════════════
+    crop_start = time.time()
     logger.info("Cropping lines (perspective transform)...")
     for line in line_items:
         box = np.array(line["box"], dtype=np.float32)
@@ -126,10 +140,12 @@ def run_ocr_pipeline(
         )
         crop_path = save_line_crop(crop, line_crops_dir, line["line_id"])
         line["persp_crop_path"] = crop_path
+    crop_time = time.time() - crop_start
 
     # ══════════════════════════════════════════════════════════════════
     # 5. Group nearby lines
     # ══════════════════════════════════════════════════════════════════
+    group_start = time.time()
     logger.info("Grouping lines...")
     groups = group_line_items(line_items, cfg)
 
@@ -145,12 +161,17 @@ def run_ocr_pipeline(
         # Also set group_crop_path on each line in this group
         for idx in group["line_indices"]:
             line_items[idx]["group_crop_path"] = crop_path
+    group_time = time.time() - group_start
 
     # ══════════════════════════════════════════════════════════════════
     # 6. VietOCR recognition
     # ══════════════════════════════════════════════════════════════════
     logger.info("Running VietOCR recognition...")
-    vietocr_predictor = create_vietocr_predictor(cfg)
+    vietocr_init_start = time.time()
+    vietocr_predictor = context.get("vietocr_predictor")
+    if vietocr_predictor is None:
+        vietocr_predictor = create_vietocr_predictor(cfg)
+    vietocr_init_time = time.time() - vietocr_init_start
     vietocr_time = recognize_all_lines(vietocr_predictor, line_items, cfg)
 
     # ══════════════════════════════════════════════════════════════════
@@ -165,12 +186,14 @@ def run_ocr_pipeline(
     # ══════════════════════════════════════════════════════════════════
     # 8. Score + Gate each line
     # ══════════════════════════════════════════════════════════════════
+    scoring_start = time.time()
     logger.info("Scoring and gating lines...")
     for line in line_items:
         score_and_gate_line(
             line, cfg, wordset, base_to_variants, wordlist_enabled,
             W, H, use_rec_missing_rule=rec_flat,
         )
+    scoring_time = time.time() - scoring_start
 
     # Log gating distribution
     status_counts = {}
@@ -184,6 +207,7 @@ def run_ocr_pipeline(
     # ══════════════════════════════════════════════════════════════════
     vintern_line_time = 0.0
     vintern_group_time = 0.0
+    vintern_init_time = 0.0
 
     if cfg.get("use_vintern_line_fallback", True) or cfg.get("use_vintern_group_fallback", True):
         from ocr_pipeline.recognizers.vintern_recognizer import (
@@ -193,7 +217,12 @@ def run_ocr_pipeline(
         )
 
         logger.info("Loading Vintern model...")
-        vintern_model, vintern_tokenizer = load_vintern_model(cfg)
+        vintern_init_start = time.time()
+        if "vintern" in context:
+            vintern_model, vintern_tokenizer = context["vintern"]
+        else:
+            vintern_model, vintern_tokenizer = load_vintern_model(cfg)
+        vintern_init_time = time.time() - vintern_init_start
 
         if cfg.get("use_vintern_line_fallback", True):
             vintern_line_time = run_vintern_line_fallback(
@@ -227,45 +256,56 @@ def run_ocr_pipeline(
     # ══════════════════════════════════════════════════════════════════
     # 13. Export outputs
     # ══════════════════════════════════════════════════════════════════
+    export_start = time.time()
     logger.info("Exporting outputs...")
 
     timing = {
+        "image_load_time_sec": round(image_load_time, 3),
+        "wordlist_load_time_sec": round(wordlist_time, 3),
+        "detector_init_time_sec": round(detector_init_time, 3),
         "det_time_sec": round(det_time, 3),
+        "crop_time_sec": round(crop_time, 3),
+        "group_time_sec": round(group_time, 3),
+        "vietocr_init_time_sec": round(vietocr_init_time, 3),
         "vietocr_total_time_sec": round(vietocr_time, 3),
+        "scoring_time_sec": round(scoring_time, 3),
+        "vintern_init_time_sec": round(vintern_init_time, 3),
         "vintern_line_total_time_sec": round(vintern_line_time, 3),
         "vintern_group_total_time_sec": round(vintern_group_time, 3),
         "total_pipeline_sec": round(time.time() - pipeline_start, 3),
     }
 
-    export_csv_lines(
+    line_csv_path = export_csv_lines(
         line_items,
         out_dir / f"{frame_id}_ocr_lines_{suffix}.csv",
     )
-    export_csv_groups(
+    group_csv_path = export_csv_groups(
         groups,
         out_dir / f"{frame_id}_ocr_groups_{suffix}.csv",
     )
-    export_es_document(
-        line_items, groups, final_clean, final_review, cfg,
-        image_path,
-        out_dir / f"{frame_id}_ocr_es_doc_{suffix}.json",
-        timing,
-    )
-    export_clean_text(
+    clean_text_path = export_clean_text(
         final_clean,
         out_dir / f"{frame_id}_ocr_clean_text_{suffix}.txt",
     )
-    export_review_text(
+    review_text_path = export_review_text(
         final_review,
         out_dir / f"{frame_id}_ocr_review_text_{suffix}.txt",
     )
-    export_visualization(
+    visualization_path = export_visualization(
         img_rgb, line_items, groups,
         out_dir / f"{frame_id}_ocr_vis_{suffix}.png",
     )
 
     pipeline_time = time.time() - pipeline_start
+    export_time = time.time() - export_start
+    timing["export_time_sec"] = round(export_time, 3)
     timing["total_pipeline_sec"] = round(pipeline_time, 3)
+    es_doc_path = export_es_document(
+        line_items, groups, final_clean, final_review, cfg,
+        image_path,
+        out_dir / f"{frame_id}_ocr_es_doc_{suffix}.json",
+        timing,
+    )
 
     logger.info(f"Pipeline complete in {pipeline_time:.2f}s")
     logger.info(f"  Detection: {det_time:.2f}s")
@@ -285,6 +325,14 @@ def run_ocr_pipeline(
         "rec_conf_flat": rec_flat,
         "wordlist_enabled": wordlist_enabled,
         "wordlist_size": len(wordset),
+        "output_paths": {
+            "line_csv": line_csv_path,
+            "group_csv": group_csv_path,
+            "es_doc": es_doc_path,
+            "clean_text": clean_text_path,
+            "review_text": review_text_path,
+            "visualization": visualization_path,
+        },
     }
 
 
