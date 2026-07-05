@@ -48,7 +48,10 @@ def get_default_config() -> dict:
 
         # ── VietOCR ───────────────────────────────────────────────────
         "vietocr_config": "vgg_transformer",
-        "vietocr_beamsearch": True,
+        "vietocr_beamsearch": False,
+        "vietocr_use_batch": True,
+        "vietocr_batch_size": 16,
+        "vietocr_max_seq_length": 128,
         "use_vietocr_return_prob": True,
         "rec_conf_fallback_when_missing": 0.50,
         "vietocr_device": None,  # auto-detect
@@ -111,7 +114,7 @@ def get_default_config() -> dict:
         "vintern_do_sample": False,
         "vintern_temperature": 0.0,
         "vintern_input_size": 448,
-        "vintern_max_tiles": 6,
+        "vintern_max_tiles": 4,
         "vintern_progress": True,
 
         "use_vintern_line_fallback": True,

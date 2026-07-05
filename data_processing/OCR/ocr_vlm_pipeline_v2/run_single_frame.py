@@ -34,7 +34,7 @@ from ocr_pipeline.cropping import (
 from ocr_pipeline.grouping import group_line_items
 from ocr_pipeline.recognizers.vietocr_recognizer import (
     create_vietocr_predictor,
-    recognize_all_lines,
+    recognize_all_lines_batch,
 )
 from ocr_pipeline.scoring.wordlist import load_wordlist
 from ocr_pipeline.scoring.gating import score_and_gate_line, detect_rec_conf_flat
@@ -172,7 +172,7 @@ def run_ocr_pipeline(
     if vietocr_predictor is None:
         vietocr_predictor = create_vietocr_predictor(cfg)
     vietocr_init_time = time.time() - vietocr_init_start
-    vietocr_time = recognize_all_lines(vietocr_predictor, line_items, cfg)
+    vietocr_time = recognize_all_lines_batch(vietocr_predictor, line_items, cfg)
 
     # ══════════════════════════════════════════════════════════════════
     # 7. Detect rec_conf flat

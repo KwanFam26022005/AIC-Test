@@ -134,6 +134,10 @@ def main() -> None:
     parser.add_argument("--pattern", default="*", help="Frame glob pattern, e.g. '*.jpg'")
     parser.add_argument("--limit", type=int, default=None, help="Only run first N frames")
     parser.add_argument("--no_vintern", action="store_true", help="Disable Vintern fallback")
+    parser.add_argument("--vietocr_batch_size", type=int, default=None, help="Override VietOCR CNN batch size")
+    parser.add_argument("--no_vietocr_batch", action="store_true", help="Disable VietOCR batch path")
+    parser.add_argument("--vintern_max_candidates", type=int, default=None, help="Max line crops sent to Vintern per frame")
+    parser.add_argument("--vintern_group_max_candidates", type=int, default=None, help="Max group crops sent to Vintern per frame")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     args = parser.parse_args()
 
@@ -163,12 +167,28 @@ def main() -> None:
     if args.no_vintern:
         cfg["use_vintern_line_fallback"] = False
         cfg["use_vintern_group_fallback"] = False
+    if args.vietocr_batch_size is not None:
+        cfg["vietocr_batch_size"] = args.vietocr_batch_size
+    if args.no_vietocr_batch:
+        cfg["vietocr_use_batch"] = False
+    if args.vintern_max_candidates is not None:
+        cfg["vintern_max_candidates"] = args.vintern_max_candidates
+    if args.vintern_group_max_candidates is not None:
+        cfg["vintern_group_max_candidates"] = args.vintern_group_max_candidates
     use_vintern = cfg.get("use_vintern_line_fallback", True) or cfg.get("use_vintern_group_fallback", True)
 
     logger.info("Video id: %s", video_id)
     logger.info("Frames: %d from %s", len(frames), frames_dir)
     logger.info("Output root: %s", output_root)
     logger.info("Vintern enabled: %s", use_vintern)
+    logger.info(
+        "Batch settings: vietocr_use_batch=%s vietocr_batch_size=%s "
+        "vintern_max_candidates=%s vintern_group_max_candidates=%s",
+        cfg.get("vietocr_use_batch"),
+        cfg.get("vietocr_batch_size"),
+        cfg.get("vintern_max_candidates"),
+        cfg.get("vintern_group_max_candidates"),
+    )
 
     batch_start = time.time()
     context, init_timing = build_context(cfg, use_vintern)

@@ -13,6 +13,7 @@ import contextlib
 import difflib
 import logging
 import math
+import os
 import time
 import warnings
 from pathlib import Path
@@ -68,11 +69,18 @@ def _progress(iterable, *, total: int, desc: str, enabled: bool):
 
 
 def _has_flash_attn() -> bool:
-    """Check if flash_attn is installed."""
+    """Check if flash_attn is installed and importable."""
+    import sys
+
     try:
         import flash_attn  # noqa: F401
+        import flash_attn.flash_attn_interface  # noqa: F401
         return True
-    except ImportError:
+    except Exception as exc:
+        logger.warning(f"flash_attn is unavailable or ABI-incompatible: {exc}")
+        for name in list(sys.modules):
+            if name == "flash_attn" or name.startswith("flash_attn."):
+                del sys.modules[name]
         return False
 
 
@@ -82,8 +90,9 @@ def _install_flash_attn_stub() -> None:
     import sys
     import types
 
-    if "flash_attn" in sys.modules:
-        return
+    for name in list(sys.modules):
+        if name == "flash_attn" or name.startswith("flash_attn."):
+            del sys.modules[name]
 
     def _unavailable(*args, **kwargs):
         raise RuntimeError("flash_attn is not installed; set attn_implementation='eager'.")
@@ -133,33 +142,57 @@ def load_vintern_model(cfg: dict):
             bnb_4bit_use_double_quant=True,
         )
 
-    # Attention implementation
-    attn_impl = cfg.get("vintern_attn_implementation")
-    if attn_impl is None:
-        attn_impl = "flash_attention_2" if _has_flash_attn() else "eager"
-    if attn_impl == "eager" and not _has_flash_attn():
-        _install_flash_attn_stub()
+    flash_available = _has_flash_attn()
 
+    # Attention implementation — priority: explicit env/config > flash_attention_2 > sdpa > eager
+    attn_impl = os.environ.get("OCR_V2_VINTERN_ATTN") or cfg.get("vintern_attn_implementation")
+    if attn_impl is None:
+        if flash_available:
+            attn_impl = "flash_attention_2"
+        else:
+            # SDPA (PyTorch ≥ 2.2) is nearly as fast as flash_attn and needs no install
+            try:
+                import torch.nn.functional as F
+                if hasattr(F, "scaled_dot_product_attention"):
+                    attn_impl = "sdpa"
+                else:
+                    attn_impl = "eager"
+            except Exception:
+                attn_impl = "eager"
+
+    if not flash_available:
+        _install_flash_attn_stub()
     # Device map
     device = cfg.get("vintern_device")
     if device is None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
     device_map = {"": device}
 
-    logger.info(f"Loading Vintern: {model_id}, device={device}, attn={attn_impl}")
-
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
-        model_id,
-        trust_remote_code=True,
-        quantization_config=quant_config,
-        device_map=device_map,
-        low_cpu_mem_usage=True,
-        attn_implementation=attn_impl,
-    ).eval()
+    fallback_order = [attn_impl]
+    for candidate in ("sdpa", "eager"):
+        if candidate not in fallback_order:
+            fallback_order.append(candidate)
 
-    logger.info(f"Vintern loaded successfully: {model_id}")
-    return model, tokenizer
+    last_error = None
+    for candidate in fallback_order:
+        logger.info(f"Loading Vintern: {model_id}, device={device}, attn={candidate}")
+        try:
+            model = AutoModel.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                quantization_config=quant_config,
+                device_map=device_map,
+                low_cpu_mem_usage=True,
+                attn_implementation=candidate,
+            ).eval()
+            logger.info(f"Vintern loaded successfully: {model_id}, attn={candidate}")
+            return model, tokenizer
+        except Exception as exc:
+            last_error = exc
+            logger.warning(f"Vintern load failed with attn={candidate}: {exc}")
+
+    raise RuntimeError(f"Could not load Vintern model {model_id}") from last_error
 
 
 def _build_transform(input_size: int):
@@ -277,6 +310,24 @@ def _preprocess_for_vintern(
     return pixel_values
 
 
+def _build_generation_config(tokenizer, cfg: dict) -> dict:
+    """Build generation config dict for Vintern, reusable across calls."""
+    generation_config = {
+        "max_new_tokens": cfg.get("vintern_max_new_tokens", 256),
+        "do_sample": cfg.get("vintern_do_sample", False),
+    }
+    if generation_config["do_sample"]:
+        generation_config["temperature"] = cfg.get("vintern_temperature", 0.0)
+
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None) or eos_token_id
+    if eos_token_id is not None:
+        generation_config["eos_token_id"] = eos_token_id
+    if pad_token_id is not None:
+        generation_config["pad_token_id"] = pad_token_id
+    return generation_config
+
+
 def vintern_ocr_crop(
     model,
     tokenizer,
@@ -297,7 +348,7 @@ def vintern_ocr_crop(
         Extracted text
     """
     input_size = cfg.get("vintern_input_size", 448)
-    max_tiles = cfg.get("vintern_max_tiles", 6)
+    max_tiles = cfg.get("vintern_max_tiles", 4)
     max_new_tokens = cfg.get("vintern_max_new_tokens", 256)
 
     # Preprocess
@@ -307,27 +358,50 @@ def vintern_ocr_crop(
     device = next(model.parameters()).device
     pixel_values = pixel_values.to(device=device, dtype=torch.float16)
 
-    # Build generation config
-    generation_config = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": cfg.get("vintern_do_sample", False),
-    }
-    if generation_config["do_sample"]:
-        generation_config["temperature"] = cfg.get("vintern_temperature", 0.0)
-
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    pad_token_id = getattr(tokenizer, "pad_token_id", None) or eos_token_id
-    if eos_token_id is not None:
-        generation_config["eos_token_id"] = eos_token_id
-    if pad_token_id is not None:
-        generation_config["pad_token_id"] = pad_token_id
+    generation_config = _build_generation_config(tokenizer, cfg)
 
     # Format prompt for Vintern chat
     question = f"<image>\n{prompt}"
 
     # Use model.chat if available (Vintern-specific API)
     try:
-        with _quiet_transformers_generation():
+        with torch.inference_mode(), _quiet_transformers_generation():
+            response = model.chat(
+                tokenizer,
+                pixel_values,
+                question,
+                generation_config,
+            )
+        if isinstance(response, tuple):
+            response = response[0]
+        return response.strip()
+    except Exception as e:
+        logger.warning(f"Vintern chat failed: {e}")
+        return ""
+
+
+def vintern_ocr_from_pixel_values(
+    model,
+    tokenizer,
+    pixel_values: torch.Tensor,
+    prompt: str,
+    generation_config: dict,
+) -> str:
+    """Run Vintern OCR on pre-loaded pixel_values (skip disk I/O).
+
+    Args:
+        model: Vintern model
+        tokenizer: Vintern tokenizer
+        pixel_values: Pre-processed tensor [num_tiles, 3, H, W] on device
+        prompt: OCR prompt
+        generation_config: Pre-built generation config
+
+    Returns:
+        Extracted text
+    """
+    question = f"<image>\n{prompt}"
+    try:
+        with torch.inference_mode(), _quiet_transformers_generation():
             response = model.chat(
                 tokenizer,
                 pixel_values,
@@ -545,6 +619,10 @@ def run_vintern_line_fallback(
 ) -> float:
     """Run Vintern fallback on top priority VLM candidates.
 
+    Optimization: Pre-loads and preprocesses ALL candidate crops before
+    starting inference. This separates disk I/O from GPU compute,
+    keeping the GPU continuously busy.
+
     Args:
         model, tokenizer: Vintern model
         line_items: All line items
@@ -569,22 +647,49 @@ def run_vintern_line_fallback(
         return 0.0
 
     logger.info(f"Running Vintern line fallback on {len(candidates)} candidates")
+
+    # ── Phase 1: Pre-load and preprocess all crops (batch I/O) ─────
+    input_size = cfg.get("vintern_input_size", 448)
+    max_tiles = cfg.get("vintern_max_tiles", 4)  # 4 tiles for line crops
+    device = next(model.parameters()).device
+
+    t_preload = time.time()
+    preloaded = []  # list of (line, pixel_values_tensor_on_device)
+    for line in candidates:
+        crop_path = line.get("persp_crop_path")
+        if not crop_path:
+            continue
+        try:
+            pv = _preprocess_for_vintern(crop_path, input_size, max_tiles)
+            pv = pv.to(device=device, dtype=torch.float16)
+            preloaded.append((line, pv))
+        except Exception as e:
+            logger.warning(f"  Line {line.get('line_id')}: preprocess failed: {e}")
+
+    preload_time = time.time() - t_preload
+    logger.info(f"Pre-loaded {len(preloaded)} Vintern crops in {preload_time:.2f}s")
+
+    # ── Phase 2: Sequential inference with pre-loaded tensors ──────
+    prompt = cfg.get("vintern_line_prompt",
+                     "Hãy đọc chính xác toàn bộ chữ trong ảnh crop này.\n"
+                     "Chỉ trả về nội dung OCR, không giải thích.\n"
+                     "Giữ nguyên tiếng Việt có dấu nếu có.")
+    gen_config = _build_generation_config(tokenizer, cfg)
+
     total_time = 0.0
     progress_enabled = cfg.get("vintern_progress", True)
     progress = _progress(
-        candidates,
-        total=len(candidates),
+        preloaded,
+        total=len(preloaded),
         desc="VLM lines",
         enabled=progress_enabled,
     )
 
-    for done, line in enumerate(progress, start=1):
-        crop_path = line.get("persp_crop_path")
-        if not crop_path:
-            continue
-
+    for done, (line, pixel_values) in enumerate(progress, start=1):
         t0 = time.time()
-        vtext = vintern_ocr_line(model, tokenizer, crop_path, cfg)
+        vtext = vintern_ocr_from_pixel_values(
+            model, tokenizer, pixel_values, prompt, gen_config
+        )
         elapsed = time.time() - t0
         total_time += elapsed
 
@@ -594,11 +699,15 @@ def run_vintern_line_fallback(
         if progress_enabled and tqdm is not None:
             avg_time = total_time / done
             progress.set_postfix_str(
-                f"last={elapsed:.1f}s avg={avg_time:.1f}s total={total_time:.1f}s"
+                f"{elapsed:.1f}s avg={avg_time:.1f}s total={total_time:.1f}s"
             )
 
-    logger.info(f"Vintern line fallback done: {len(candidates)} lines in {total_time:.2f}s")
-    return total_time
+        # Free tensor immediately after use to save VRAM
+        del pixel_values
+
+    logger.info(f"Vintern line fallback done: {len(preloaded)} lines in {total_time:.2f}s "
+                f"(preload={preload_time:.2f}s)")
+    return total_time + preload_time
 
 
 def run_vintern_group_fallback(
