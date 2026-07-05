@@ -10,9 +10,11 @@ once, then reused for every frame.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import logging
+import multiprocessing
 import os
 import shutil
 import sys
@@ -34,6 +36,12 @@ from run_single_frame import run_ocr_pipeline
 logger = logging.getLogger(__name__)
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+_WORKER_STATE: dict = {}
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm is listed in requirements.
+    tqdm = None
 
 
 def natural_frame_key(path: Path) -> tuple[int, str]:
@@ -126,7 +134,52 @@ def format_eta(done: int, total: int, elapsed: float) -> str:
         return "?"
     remaining = max(total - done, 0)
     eta_sec = remaining * (elapsed / done)
-    return f"{eta_sec / 60:.1f}m"
+    return format_duration(eta_sec)
+
+
+def format_duration(seconds: float) -> str:
+    """Format seconds as compact wall-clock text."""
+    seconds = max(0, int(round(seconds)))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes:d}m{secs:02d}s"
+    return f"{secs:d}s"
+
+
+def projected_total(done: int, elapsed: float, total: int) -> str:
+    if done <= 0:
+        return "?"
+    return format_duration(elapsed / done * total)
+
+
+def progress_message(
+    idx: int,
+    total: int,
+    frame_id: str,
+    frame_elapsed: float,
+    elapsed: float,
+    timing: dict,
+    clean_chars: int,
+    review_chars: int,
+) -> str:
+    avg = elapsed / max(1, idx)
+    vintern_time = (
+        timing.get("vintern_line_total_time_sec", 0.0)
+        + timing.get("vintern_group_total_time_sec", 0.0)
+    )
+    percent = 100.0 * idx / max(1, total)
+    return (
+        f"[{idx}/{total} {percent:5.1f}%] frame={frame_id} "
+        f"wall={frame_elapsed:.2f}s avg={avg:.2f}s/frame "
+        f"elapsed={format_duration(elapsed)} ETA={format_eta(idx, total, elapsed)} "
+        f"total~{projected_total(idx, elapsed, total)} "
+        f"det={timing.get('det_time_sec', 0.0):.2f}s "
+        f"vietocr={timing.get('vietocr_total_time_sec', 0.0):.2f}s "
+        f"vintern={vintern_time:.2f}s clean={clean_chars} review={review_chars}"
+    )
 
 
 def configure_runtime_noise(quiet: bool) -> None:
@@ -171,6 +224,90 @@ def cleanup_frame_crops(frame_output_dir: Path, cfg: dict) -> None:
             shutil.rmtree(target)
 
 
+def process_frame(
+    *,
+    idx: int,
+    total: int,
+    frame_path: Path,
+    frame_output_dir: Path,
+    cfg: dict,
+    context: dict,
+    video_id: str,
+    cleanup_crops: bool,
+) -> tuple[dict, dict, float]:
+    """Run OCR for one frame and return ES doc, summary row, and wall time."""
+    frame_start = time.time()
+    frame_cfg = dict(cfg)
+    result = run_ocr_pipeline(
+        str(frame_path),
+        frame_cfg,
+        output_dir=str(frame_output_dir),
+        context=context,
+    )
+
+    doc = build_es_document(
+        result["line_items"],
+        result["groups"],
+        result["final_clean_text"],
+        result["final_review_text"],
+        frame_cfg,
+        str(frame_path),
+        result["timing"],
+    )
+    doc["video_id"] = video_id
+    doc["document_id"] = f"{video_id}:{result['frame_id']}"
+    doc["batch_output_paths"] = result.get("output_paths", {})
+
+    if cleanup_crops:
+        cleanup_frame_crops(frame_output_dir, frame_cfg)
+
+    frame_elapsed = time.time() - frame_start
+    timing = result.get("timing", {})
+    row = {
+        "video_id": video_id,
+        "frame_id": result["frame_id"],
+        "frame_number": doc.get("frame_number"),
+        "image_path": str(frame_path),
+        "lines_detected": len(result["line_items"]),
+        "groups_formed": len(result["groups"]),
+        "clean_chars": len(result["final_clean_text"]),
+        "review_chars": len(result["final_review_text"]),
+        "gating_stats": json.dumps(result["gating_stats"], ensure_ascii=False),
+        "rec_conf_flat": result["rec_conf_flat"],
+        "frame_wall_time_sec": round(frame_elapsed, 3),
+        "batch_index": idx,
+        "batch_total": total,
+        **timing,
+    }
+    return doc, row, frame_elapsed
+
+
+def init_parallel_worker(cfg: dict, use_vintern: bool, quiet: bool) -> None:
+    """Load reusable models once in each worker process."""
+    configure_runtime_noise(True)
+    logging.getLogger().setLevel(logging.WARNING if quiet else logging.INFO)
+    context, init_timing = build_context(cfg, use_vintern)
+    _WORKER_STATE["cfg"] = cfg
+    _WORKER_STATE["context"] = context
+    _WORKER_STATE["init_timing"] = init_timing
+
+
+def process_frame_parallel(payload: dict) -> tuple[dict, dict, float]:
+    """Worker entrypoint for ProcessPoolExecutor."""
+    cfg = _WORKER_STATE["cfg"]
+    context = _WORKER_STATE["context"]
+    return process_frame(
+        idx=payload["idx"],
+        total=payload["total"],
+        frame_path=Path(payload["frame_path"]),
+        frame_output_dir=Path(payload["frame_output_dir"]),
+        cfg=cfg,
+        context=context,
+        video_id=payload["video_id"],
+        cleanup_crops=payload["cleanup_crops"],
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run OCR VLM Pipeline v2 on a folder of frames")
     parser.add_argument("--frames_dir", required=True, help="Folder containing extracted frames")
@@ -193,6 +330,13 @@ def main() -> None:
     parser.add_argument("--cleanup_crops", action="store_true", help="Delete per-frame crop folders after each frame")
     parser.add_argument("--quiet", action="store_true", help="Hide per-stage logs; keep per-frame timing summaries")
     parser.add_argument("--show_vintern_progress", action="store_true", help="Show per-crop Vintern tqdm bars")
+    parser.add_argument("--no_progress", action="store_true", help="Disable the frame progress bar")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel worker processes. Try 2 first on a 24GB GPU.",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     args = parser.parse_args()
 
@@ -239,6 +383,7 @@ def main() -> None:
     if args.vintern_group_max_candidates is not None:
         cfg["vintern_group_max_candidates"] = args.vintern_group_max_candidates
     use_vintern = cfg.get("use_vintern_line_fallback", True) or cfg.get("use_vintern_group_fallback", True)
+    workers = max(1, int(args.workers))
 
     logger.info("Video id: %s", video_id)
     logger.info("Frames: %d from %s", len(frames), frames_dir)
@@ -256,78 +401,121 @@ def main() -> None:
         cfg.get("vintern_max_candidates"),
         cfg.get("vintern_group_max_candidates"),
     )
+    logger.info("Frame progress: enabled=%s workers=%d", not args.no_progress, workers)
 
     batch_start = time.time()
-    context, init_timing = build_context(cfg, use_vintern)
-    logger.info("Initialization timing: %s", init_timing)
-
     rows: list[dict] = []
-    for idx, frame_path in enumerate(frames, start=1):
-        frame_start = time.time()
-        frame_id = frame_path.stem
-        frame_output_dir = per_frame_root / frame_id
+    init_timing: dict = {}
+    progress_enabled = not args.no_progress
+    progress_bar = None
+    if progress_enabled and tqdm is not None:
+        progress_bar = tqdm(total=len(frames), desc=f"OCR {video_id}", unit="frame", dynamic_ncols=True)
 
-        logger.info("[%d/%d] Processing frame=%s", idx, len(frames), frame_id)
-        frame_cfg = dict(cfg)
-        result = run_ocr_pipeline(
-            str(frame_path),
-            frame_cfg,
-            output_dir=str(frame_output_dir),
-            context=context,
-        )
+    if workers == 1:
+        context, init_timing = build_context(cfg, use_vintern)
+        logger.info("Initialization timing: %s", init_timing)
 
-        doc = build_es_document(
-            result["line_items"],
-            result["groups"],
-            result["final_clean_text"],
-            result["final_review_text"],
-            frame_cfg,
-            str(frame_path),
-            result["timing"],
-        )
-        doc["video_id"] = video_id
-        doc["document_id"] = f"{video_id}:{result['frame_id']}"
-        doc["batch_output_paths"] = result.get("output_paths", {})
-        append_jsonl(es_jsonl_path, doc)
+        for idx, frame_path in enumerate(frames, start=1):
+            frame_output_dir = per_frame_root / frame_path.stem
+            if not quiet:
+                logger.info("[%d/%d] Processing frame=%s", idx, len(frames), frame_path.stem)
 
-        if args.cleanup_crops:
-            cleanup_frame_crops(frame_output_dir, frame_cfg)
+            doc, row, frame_elapsed = process_frame(
+                idx=idx,
+                total=len(frames),
+                frame_path=frame_path,
+                frame_output_dir=frame_output_dir,
+                cfg=cfg,
+                context=context,
+                video_id=video_id,
+                cleanup_crops=args.cleanup_crops,
+            )
+            append_jsonl(es_jsonl_path, doc)
+            rows.append(row)
 
-        frame_elapsed = time.time() - frame_start
-        timing = result.get("timing", {})
-        row = {
-            "video_id": video_id,
-            "frame_id": result["frame_id"],
-            "frame_number": doc.get("frame_number"),
-            "image_path": str(frame_path),
-            "lines_detected": len(result["line_items"]),
-            "groups_formed": len(result["groups"]),
-            "clean_chars": len(result["final_clean_text"]),
-            "review_chars": len(result["final_review_text"]),
-            "gating_stats": json.dumps(result["gating_stats"], ensure_ascii=False),
-            "rec_conf_flat": result["rec_conf_flat"],
-            "frame_wall_time_sec": round(frame_elapsed, 3),
-            **timing,
+            elapsed = time.time() - batch_start
+            msg = progress_message(
+                idx,
+                len(frames),
+                str(row["frame_id"]),
+                frame_elapsed,
+                elapsed,
+                row,
+                int(row["clean_chars"]),
+                int(row["review_chars"]),
+            )
+            if progress_bar is not None:
+                progress_bar.update(1)
+                progress_bar.set_postfix_str(
+                    f"avg={elapsed / idx:.2f}s ETA={format_eta(idx, len(frames), elapsed)} "
+                    f"frame={row['frame_id']}"
+                )
+                if not quiet:
+                    progress_bar.write(msg)
+            else:
+                logger.info(msg)
+    else:
+        init_timing = {
+            "workers": workers,
+            "note": "Each worker initializes detector, VietOCR, and Vintern independently.",
         }
-        rows.append(row)
+        payloads = [
+            {
+                "idx": idx,
+                "total": len(frames),
+                "frame_path": str(frame_path),
+                "frame_output_dir": str(per_frame_root / frame_path.stem),
+                "video_id": video_id,
+                "cleanup_crops": args.cleanup_crops,
+            }
+            for idx, frame_path in enumerate(frames, start=1)
+        ]
+        completed = 0
+        mp_context = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=mp_context,
+            initializer=init_parallel_worker,
+            initargs=(cfg, use_vintern, quiet),
+        ) as executor:
+            future_to_payload = {
+                executor.submit(process_frame_parallel, payload): payload
+                for payload in payloads
+            }
+            for future in concurrent.futures.as_completed(future_to_payload):
+                payload = future_to_payload[future]
+                doc, row, frame_elapsed = future.result()
+                append_jsonl(es_jsonl_path, doc)
+                rows.append(row)
+                completed += 1
 
-        elapsed = time.time() - batch_start
-        logger.info(
-            "[%d/%d] frame=%s wall=%.2fs det=%.2fs vietocr=%.2fs vintern=%.2fs clean=%d review=%d ETA=%s",
-            idx,
-            len(frames),
-            frame_id,
-            frame_elapsed,
-            timing.get("det_time_sec", 0.0),
-            timing.get("vietocr_total_time_sec", 0.0),
-            timing.get("vintern_line_total_time_sec", 0.0)
-            + timing.get("vintern_group_total_time_sec", 0.0),
-            len(result["final_clean_text"]),
-            len(result["final_review_text"]),
-            format_eta(idx, len(frames), elapsed),
-        )
+                elapsed = time.time() - batch_start
+                msg = progress_message(
+                    completed,
+                    len(frames),
+                    str(row["frame_id"]),
+                    frame_elapsed,
+                    elapsed,
+                    row,
+                    int(row["clean_chars"]),
+                    int(row["review_chars"]),
+                )
+                if progress_bar is not None:
+                    progress_bar.update(1)
+                    progress_bar.set_postfix_str(
+                        f"avg={elapsed / completed:.2f}s ETA={format_eta(completed, len(frames), elapsed)} "
+                        f"last={row['frame_id']}"
+                    )
+                    if not quiet:
+                        progress_bar.write(msg)
+                else:
+                    logger.info(msg)
+
+    if progress_bar is not None:
+        progress_bar.close()
 
     total_elapsed = time.time() - batch_start
+    rows.sort(key=lambda row: (row.get("batch_index", 10**18), str(row.get("frame_id", ""))))
     write_summary_csv(summary_csv_path, rows)
     summary = {
         "video_id": video_id,
