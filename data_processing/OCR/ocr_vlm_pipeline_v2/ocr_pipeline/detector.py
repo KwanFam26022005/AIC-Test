@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import Counter
 from typing import Any
 
 import cv2
@@ -276,26 +277,49 @@ def parse_text_detection_output(det_output) -> tuple[list[np.ndarray], list[floa
     return boxes, det_scores
 
 
-def _valid_box(box: np.ndarray, det_score: float, cfg: dict) -> bool:
-    """Check if a detected box passes filtering criteria."""
-    if det_score < cfg.get("drop_low_det_score_below", 0.0):
-        return False
-
+def _box_geometry(box: np.ndarray) -> tuple[float, float, float, float]:
+    """Return width, height, horizontal aspect, and thinness ratio."""
     xs = box[:, 0]
     ys = box[:, 1]
     width = float(xs.max() - xs.min())
     height = float(ys.max() - ys.min())
+    horizontal_aspect = width / max(height, 1e-6)
+    thinness = min(width, height) / max(width, height) if max(width, height) > 0 else 0.0
+    return width, height, horizontal_aspect, thinness
 
+
+def _box_filter_result(box: np.ndarray, det_score: float, cfg: dict) -> tuple[bool, str | None, dict]:
+    """Check if a detected box passes filtering criteria.
+
+    The notebook baseline uses width / height as the aspect ratio. Keep that
+    behavior so very wide subtitle/ticker boxes are preserved instead of being
+    dropped as "thin" boxes.
+    """
+    if det_score < cfg.get("drop_low_det_score_below", 0.0):
+        return False, "low_score", {}
+
+    width, height, aspect, thinness = _box_geometry(box)
+    metrics = {
+        "box_width": width,
+        "box_height": height,
+        "box_aspect": aspect,
+        "box_thinness": thinness,
+    }
     if width < cfg.get("min_box_width", 10):
-        return False
+        return False, "small_width", metrics
     if height < cfg.get("min_box_height", 8):
-        return False
+        return False, "small_height", metrics
 
-    aspect = min(width, height) / max(width, height) if max(width, height) > 0 else 0
     if aspect < cfg.get("min_box_aspect_ratio", 0.25):
-        return False
+        return False, "narrow_aspect", metrics
 
-    return True
+    return True, None, metrics
+
+
+def _valid_box(box: np.ndarray, det_score: float, cfg: dict) -> bool:
+    """Check if a detected box passes filtering criteria."""
+    keep, _, _ = _box_filter_result(box, det_score, cfg)
+    return keep
 
 
 def _box_to_bbox_xyxy(box: np.ndarray) -> list[int]:
@@ -339,8 +363,20 @@ def detect_lines(detector, img_rgb: np.ndarray, cfg: dict) -> tuple[list[dict], 
 
     line_items = []
     line_id = 0
+    drop_reasons = Counter()
     for det_idx, (box, det_score) in enumerate(zip(boxes, det_scores)):
-        if not _valid_box(box, det_score, cfg):
+        keep, drop_reason, metrics = _box_filter_result(box, det_score, cfg)
+        if not keep:
+            drop_reasons[drop_reason or "unknown"] += 1
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Drop raw box det_idx=%s reason=%s score=%.3f bbox=%s metrics=%s",
+                    det_idx,
+                    drop_reason,
+                    det_score,
+                    _box_to_bbox_xyxy(box),
+                    {k: round(v, 3) for k, v in metrics.items()},
+                )
             continue
 
         line_items.append({
@@ -349,10 +385,16 @@ def detect_lines(detector, img_rgb: np.ndarray, cfg: dict) -> tuple[list[dict], 
             "box": box.tolist(),
             "bbox_xyxy": _box_to_bbox_xyxy(box),
             "det_score": det_score,
+            **metrics,
         })
         line_id += 1
 
-    logger.info(f"After filtering: {len(line_items)} valid lines (dropped {len(boxes) - len(line_items)})")
+    logger.info(
+        "After filtering: %d valid lines (dropped %d, reasons=%s)",
+        len(line_items),
+        len(boxes) - len(line_items),
+        dict(drop_reasons),
+    )
     return line_items, det_time
 
 
