@@ -9,10 +9,12 @@ Handles:
 """
 from __future__ import annotations
 
+import contextlib
 import difflib
 import logging
 import math
 import time
+import warnings
 from pathlib import Path
 
 import cv2
@@ -27,6 +29,42 @@ logger = logging.getLogger(__name__)
 # ImageNet normalization
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm is listed in requirements.
+    tqdm = None
+
+
+@contextlib.contextmanager
+def _quiet_transformers_generation():
+    """Temporarily silence repetitive Transformers generation warnings."""
+    old_verbosity = None
+    try:
+        from transformers.utils import logging as hf_logging
+
+        old_verbosity = hf_logging.get_verbosity()
+        hf_logging.set_verbosity_error()
+    except Exception:
+        hf_logging = None
+
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*do_sample.*temperature.*")
+            warnings.filterwarnings("ignore", message=".*pad_token_id.*eos_token_id.*")
+            warnings.filterwarnings("ignore", message=".*Starting from v4\\.46.*")
+            yield
+    finally:
+        if old_verbosity is not None and hf_logging is not None:
+            hf_logging.set_verbosity(old_verbosity)
+
+
+def _progress(iterable, *, total: int, desc: str, enabled: bool):
+    """Return a tqdm progress bar when available and enabled."""
+    if not enabled or tqdm is None:
+        return iterable
+    return tqdm(iterable, total=total, desc=desc, unit="crop", dynamic_ncols=True)
 
 
 def _has_flash_attn() -> bool:
@@ -274,20 +312,28 @@ def vintern_ocr_crop(
         "max_new_tokens": max_new_tokens,
         "do_sample": cfg.get("vintern_do_sample", False),
     }
-    if not generation_config["do_sample"]:
-        generation_config["temperature"] = 0.0
+    if generation_config["do_sample"]:
+        generation_config["temperature"] = cfg.get("vintern_temperature", 0.0)
+
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None) or eos_token_id
+    if eos_token_id is not None:
+        generation_config["eos_token_id"] = eos_token_id
+    if pad_token_id is not None:
+        generation_config["pad_token_id"] = pad_token_id
 
     # Format prompt for Vintern chat
     question = f"<image>\n{prompt}"
 
     # Use model.chat if available (Vintern-specific API)
     try:
-        response = model.chat(
-            tokenizer,
-            pixel_values,
-            question,
-            generation_config,
-        )
+        with _quiet_transformers_generation():
+            response = model.chat(
+                tokenizer,
+                pixel_values,
+                question,
+                generation_config,
+            )
         if isinstance(response, tuple):
             response = response[0]
         return response.strip()
@@ -524,8 +570,15 @@ def run_vintern_line_fallback(
 
     logger.info(f"Running Vintern line fallback on {len(candidates)} candidates")
     total_time = 0.0
+    progress_enabled = cfg.get("vintern_progress", True)
+    progress = _progress(
+        candidates,
+        total=len(candidates),
+        desc="VLM lines",
+        enabled=progress_enabled,
+    )
 
-    for line in candidates:
+    for done, line in enumerate(progress, start=1):
         crop_path = line.get("persp_crop_path")
         if not crop_path:
             continue
@@ -538,6 +591,11 @@ def run_vintern_line_fallback(
         logger.debug(f"  Line {line.get('line_id')}: Vintern={vtext!r} ({elapsed:.2f}s)")
 
         decide_line_final_text(line, vtext, cfg, wordset, base_to_variants, wordlist_enabled)
+        if progress_enabled and tqdm is not None:
+            avg_time = total_time / done
+            progress.set_postfix_str(
+                f"last={elapsed:.1f}s avg={avg_time:.1f}s total={total_time:.1f}s"
+            )
 
     logger.info(f"Vintern line fallback done: {len(candidates)} lines in {total_time:.2f}s")
     return total_time
@@ -601,8 +659,15 @@ def run_vintern_group_fallback(
 
     logger.info(f"Running Vintern group fallback on {len(candidates)} groups")
     total_time = 0.0
+    progress_enabled = cfg.get("vintern_progress", True)
+    progress = _progress(
+        candidates,
+        total=len(candidates),
+        desc="VLM groups",
+        enabled=progress_enabled,
+    )
 
-    for group in candidates:
+    for done, group in enumerate(progress, start=1):
         crop_path = group["group_crop_path"]
 
         t0 = time.time()
@@ -616,6 +681,11 @@ def run_vintern_group_fallback(
             group, gv_text, line_items, cfg,
             wordset, base_to_variants, wordlist_enabled
         )
+        if progress_enabled and tqdm is not None:
+            avg_time = total_time / done
+            progress.set_postfix_str(
+                f"last={elapsed:.1f}s avg={avg_time:.1f}s total={total_time:.1f}s"
+            )
 
     logger.info(f"Vintern group fallback done: {len(candidates)} groups in {total_time:.2f}s")
     return total_time

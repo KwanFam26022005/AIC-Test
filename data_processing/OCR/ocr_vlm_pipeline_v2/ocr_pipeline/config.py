@@ -112,6 +112,7 @@ def get_default_config() -> dict:
         "vintern_temperature": 0.0,
         "vintern_input_size": 448,
         "vintern_max_tiles": 6,
+        "vintern_progress": True,
 
         "use_vintern_line_fallback": True,
         "vintern_max_candidates": 8,
