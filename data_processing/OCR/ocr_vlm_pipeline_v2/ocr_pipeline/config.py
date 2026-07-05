@@ -173,6 +173,12 @@ def get_default_config() -> dict:
         "group_crops_subdir": "ppocr_stacked_group_crops",
         "output_suffix": "wordlist_gating_v2",
         "es_include_review_in_search": False,
+        "export_line_csv": True,
+        "export_group_csv": True,
+        "export_clean_text": True,
+        "export_review_text": True,
+        "export_visualization": True,
+        "export_es_doc": True,
     }
 
 

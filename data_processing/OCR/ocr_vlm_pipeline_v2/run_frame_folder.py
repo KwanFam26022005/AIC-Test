@@ -13,8 +13,11 @@ import argparse
 import csv
 import json
 import logging
+import os
+import shutil
 import sys
 import time
+import warnings
 from pathlib import Path
 from statistics import mean
 
@@ -126,6 +129,48 @@ def format_eta(done: int, total: int, elapsed: float) -> str:
     return f"{eta_sec / 60:.1f}m"
 
 
+def configure_runtime_noise(quiet: bool) -> None:
+    """Reduce repetitive third-party logs during long video runs."""
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    os.environ.setdefault("FLAGS_minloglevel", "2")
+    os.environ.setdefault("GLOG_minloglevel", "2")
+
+    warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
+    warnings.filterwarnings("ignore", message=".*enable_nested_tensor is True.*")
+    warnings.filterwarnings("ignore", message=".*Importing from timm.models.layers is deprecated.*")
+    warnings.filterwarnings("ignore", message=".*Using `TRANSFORMERS_CACHE` is deprecated.*")
+
+    if quiet:
+        logging.getLogger("ocr_pipeline").setLevel(logging.WARNING)
+        logging.getLogger("run_single_frame").setLevel(logging.WARNING)
+
+
+def apply_artifact_mode(cfg: dict, mode: str) -> None:
+    """Control expensive per-frame artifacts for batch runs."""
+    if mode == "full":
+        return
+
+    cfg["export_line_csv"] = False
+    cfg["export_group_csv"] = False
+    cfg["export_clean_text"] = False
+    cfg["export_review_text"] = False
+    cfg["export_visualization"] = False
+    cfg["export_es_doc"] = False
+
+
+def cleanup_frame_crops(frame_output_dir: Path, cfg: dict) -> None:
+    """Remove generated crop folders after ES JSONL has been written."""
+    for subdir in (
+        cfg.get("line_crops_subdir", "ppocr_line_perspective_crops"),
+        cfg.get("group_crops_subdir", "ppocr_stacked_group_crops"),
+    ):
+        target = frame_output_dir / subdir
+        if target.exists() and target.is_dir():
+            shutil.rmtree(target)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run OCR VLM Pipeline v2 on a folder of frames")
     parser.add_argument("--frames_dir", required=True, help="Folder containing extracted frames")
@@ -139,15 +184,28 @@ def main() -> None:
     parser.add_argument("--no_vietocr_batch", action="store_true", help="Disable VietOCR batch decoder")
     parser.add_argument("--vintern_max_candidates", type=int, default=None, help="Max line crops sent to Vintern per frame")
     parser.add_argument("--vintern_group_max_candidates", type=int, default=None, help="Max group crops sent to Vintern per frame")
+    parser.add_argument(
+        "--batch_artifacts",
+        choices=("minimal", "full"),
+        default="minimal",
+        help="minimal writes ES JSONL + summaries only; full also writes per-frame CSV/TXT/PNG/JSON",
+    )
+    parser.add_argument("--cleanup_crops", action="store_true", help="Delete per-frame crop folders after each frame")
+    parser.add_argument("--quiet", action="store_true", help="Hide per-stage logs; keep per-frame timing summaries")
+    parser.add_argument("--show_vintern_progress", action="store_true", help="Show per-crop Vintern tqdm bars")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     args = parser.parse_args()
+
+    quiet = args.quiet and not args.verbose
+    configure_runtime_noise(quiet)
 
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format="%(asctime)s %(message)s" if quiet else "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    configure_runtime_noise(quiet)
 
     frames_dir = Path(args.frames_dir)
     video_id = args.video_id or frames_dir.name
@@ -165,6 +223,8 @@ def main() -> None:
     es_jsonl_path.write_text("", encoding="utf-8")
 
     cfg = make_config(output_dir=str(output_root))
+    apply_artifact_mode(cfg, args.batch_artifacts)
+    cfg["vintern_progress"] = bool(args.show_vintern_progress)
     if args.no_vintern:
         cfg["use_vintern_line_fallback"] = False
         cfg["use_vintern_group_fallback"] = False
@@ -185,10 +245,14 @@ def main() -> None:
     logger.info("Output root: %s", output_root)
     logger.info("Vintern enabled: %s", use_vintern)
     logger.info(
-        "Batch settings: vietocr_use_batch=%s vietocr_batch_size=%s "
-        "vintern_max_candidates=%s vintern_group_max_candidates=%s",
+        "Batch settings: artifacts=%s cleanup_crops=%s vietocr_use_batch=%s "
+        "vietocr_batch_size=%s vintern_progress=%s vintern_max_candidates=%s "
+        "vintern_group_max_candidates=%s",
+        args.batch_artifacts,
+        args.cleanup_crops,
         cfg.get("vietocr_use_batch"),
         cfg.get("vietocr_batch_size"),
+        cfg.get("vintern_progress"),
         cfg.get("vintern_max_candidates"),
         cfg.get("vintern_group_max_candidates"),
     )
@@ -225,6 +289,9 @@ def main() -> None:
         doc["document_id"] = f"{video_id}:{result['frame_id']}"
         doc["batch_output_paths"] = result.get("output_paths", {})
         append_jsonl(es_jsonl_path, doc)
+
+        if args.cleanup_crops:
+            cleanup_frame_crops(frame_output_dir, frame_cfg)
 
         frame_elapsed = time.time() - frame_start
         timing = result.get("timing", {})

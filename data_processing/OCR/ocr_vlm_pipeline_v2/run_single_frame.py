@@ -279,37 +279,50 @@ def run_ocr_pipeline(
         "total_pipeline_sec": round(time.time() - pipeline_start, 3),
     }
 
-    line_csv_path = export_csv_lines(
-        line_items,
-        out_dir / f"{frame_id}_ocr_lines_{suffix}.csv",
-    )
-    group_csv_path = export_csv_groups(
-        groups,
-        out_dir / f"{frame_id}_ocr_groups_{suffix}.csv",
-    )
-    clean_text_path = export_clean_text(
-        final_clean,
-        out_dir / f"{frame_id}_ocr_clean_text_{suffix}.txt",
-    )
-    review_text_path = export_review_text(
-        final_review,
-        out_dir / f"{frame_id}_ocr_review_text_{suffix}.txt",
-    )
-    visualization_path = export_visualization(
-        img_rgb, line_items, groups,
-        out_dir / f"{frame_id}_ocr_vis_{suffix}.png",
-    )
+    line_csv_path = None
+    group_csv_path = None
+    clean_text_path = None
+    review_text_path = None
+    visualization_path = None
+    es_doc_path = None
+
+    if cfg.get("export_line_csv", True):
+        line_csv_path = export_csv_lines(
+            line_items,
+            out_dir / f"{frame_id}_ocr_lines_{suffix}.csv",
+        )
+    if cfg.get("export_group_csv", True):
+        group_csv_path = export_csv_groups(
+            groups,
+            out_dir / f"{frame_id}_ocr_groups_{suffix}.csv",
+        )
+    if cfg.get("export_clean_text", True):
+        clean_text_path = export_clean_text(
+            final_clean,
+            out_dir / f"{frame_id}_ocr_clean_text_{suffix}.txt",
+        )
+    if cfg.get("export_review_text", True):
+        review_text_path = export_review_text(
+            final_review,
+            out_dir / f"{frame_id}_ocr_review_text_{suffix}.txt",
+        )
+    if cfg.get("export_visualization", True):
+        visualization_path = export_visualization(
+            img_rgb, line_items, groups,
+            out_dir / f"{frame_id}_ocr_vis_{suffix}.png",
+        )
 
     pipeline_time = time.time() - pipeline_start
     export_time = time.time() - export_start
     timing["export_time_sec"] = round(export_time, 3)
     timing["total_pipeline_sec"] = round(pipeline_time, 3)
-    es_doc_path = export_es_document(
-        line_items, groups, final_clean, final_review, cfg,
-        image_path,
-        out_dir / f"{frame_id}_ocr_es_doc_{suffix}.json",
-        timing,
-    )
+    if cfg.get("export_es_doc", True):
+        es_doc_path = export_es_document(
+            line_items, groups, final_clean, final_review, cfg,
+            image_path,
+            out_dir / f"{frame_id}_ocr_es_doc_{suffix}.json",
+            timing,
+        )
 
     logger.info(f"Pipeline complete in {pipeline_time:.2f}s")
     logger.info(f"  Detection: {det_time:.2f}s")
