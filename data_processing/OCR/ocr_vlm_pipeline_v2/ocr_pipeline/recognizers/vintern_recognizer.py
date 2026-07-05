@@ -474,8 +474,12 @@ def decide_line_final_text(
     """
     from ..scoring.wordlist import extract_tokens, get_eval_tokens, compute_lex_ratio, compute_diacritic_susp
     from ..scoring.features import compute_charset_penalty, compute_repetition_penalty, compute_composite_score
+    from ..structural_filter import classify_noise_text
 
     line_item["vintern_text"] = vintern_text
+    vintern_noise_reason = classify_noise_text(vintern_text, cfg)
+    if vintern_noise_reason:
+        line_item["vintern_noise_reason"] = vintern_noise_reason
 
     vietocr_text = line_item.get("vietocr_text", "")
     old_score = line_item.get("composite_score", 0.0)
@@ -507,7 +511,13 @@ def decide_line_final_text(
     min_accept = cfg.get("vintern_min_composite_accept", 0.55)
     margin = cfg.get("vintern_override_margin", 0.05)
 
-    if similarity >= agree_threshold:
+    if vintern_noise_reason:
+        line_item["final_text"] = vietocr_text
+        line_item["final_source"] = "vintern_line_noise_rejected"
+        line_item["keep_for_index"] = False
+        line_item["need_review"] = True
+
+    elif similarity >= agree_threshold:
         # Agreement: pick better score
         if v_composite >= old_score:
             line_item["final_text"] = vintern_text
@@ -552,8 +562,12 @@ def decide_group_final_text(
     """
     from ..scoring.wordlist import extract_tokens, get_eval_tokens, compute_lex_ratio, compute_diacritic_susp
     from ..scoring.features import compute_charset_penalty, compute_repetition_penalty, compute_composite_score
+    from ..structural_filter import classify_noise_text
 
     group["group_vintern_text"] = vintern_text
+    vintern_noise_reason = classify_noise_text(vintern_text, cfg)
+    if vintern_noise_reason:
+        group["group_vintern_noise_reason"] = vintern_noise_reason
 
     # Compute Vintern group composite score
     v_tokens = extract_tokens(vintern_text)
@@ -595,7 +609,11 @@ def decide_group_final_text(
         and v_charset <= accept_charset
     )
 
-    if hard_accept or soft_accept:
+    if vintern_noise_reason:
+        group["group_final_source"] = "vintern_group_noise_rejected"
+        group["group_keep_for_index"] = False
+        group["need_review"] = True
+    elif hard_accept or soft_accept:
         group["group_text_clean"] = vintern_text
         group["group_text"] = vintern_text
         group["group_final_source"] = "vintern_group_fallback"

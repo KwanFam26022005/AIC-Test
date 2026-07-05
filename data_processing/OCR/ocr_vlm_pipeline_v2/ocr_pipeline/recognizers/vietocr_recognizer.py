@@ -299,6 +299,39 @@ def _greedy_decode_from_memory(
     return translated[1:], prob  # skip SOS
 
 
+def _is_batch_decode_suspicious(
+    text: str,
+    prob: float | None,
+    cfg: dict,
+    max_seq_length: int,
+) -> bool:
+    """Detect outputs from the custom batch decoder that should be rechecked.
+
+    The custom fast path is experimental. When it misses EOS it tends to emit
+    long low-diversity strings such as "IIII..." or "DpDPP...". Re-run those
+    crops through VietOCR's official Predictor API before scoring/indexing.
+    """
+    from ..structural_filter import classify_noise_text
+
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+
+    if classify_noise_text(stripped, cfg):
+        return True
+
+    max_len_ratio = float(cfg.get("vietocr_batch_max_output_len_ratio", 0.75))
+    if len(stripped) >= int(max_seq_length * max_len_ratio):
+        return True
+
+    min_len = int(cfg.get("vietocr_batch_fallback_min_text_len", 12))
+    prob_threshold = float(cfg.get("vietocr_batch_fallback_prob_below", 0.35))
+    if prob is not None and prob < prob_threshold and len(stripped) >= min_len:
+        return True
+
+    return False
+
+
 def recognize_all_lines_batch(
     predictor,
     line_items: list[dict],
@@ -321,7 +354,7 @@ def recognize_all_lines_batch(
     """
     batch_size = cfg.get("vietocr_batch_size", 16)
     max_seq = cfg.get("vietocr_max_seq_length", 128)
-    use_batch = cfg.get("vietocr_use_batch", True)
+    use_batch = cfg.get("vietocr_use_batch", False)
 
     if not use_batch:
         return recognize_all_lines(predictor, line_items, cfg)
@@ -352,6 +385,7 @@ def recognize_all_lines_batch(
 
         valid_indices.append(i)
         pil_images.append(pil_img)
+    pil_by_line_idx = dict(zip(valid_indices, pil_images))
 
     t_load = time.time() - t_load_start
 
@@ -385,6 +419,7 @@ def recognize_all_lines_batch(
 
     # ── Phase 4: Sequential decode each memory ──────────────────────
     t_decode_start = time.time()
+    fallback_count = 0
     sos_token = 1
     eos_token = 2
 
@@ -410,9 +445,29 @@ def recognize_all_lines_batch(
         except Exception:
             text = "".join(vocab.lookup_tokens(token_ids))
 
+        source = "batch_greedy"
+        conf = prob
+        if cfg.get("vietocr_batch_noise_fallback", True) and _is_batch_decode_suspicious(
+            text, prob, cfg, max_seq
+        ):
+            fallback_count += 1
+            pil_img = pil_by_line_idx.get(line_idx)
+            if pil_img is not None:
+                fb_text, fb_conf, fb_source = vietocr_predict_with_conf(
+                    predictor,
+                    pil_img,
+                    cfg.get("use_vietocr_return_prob", True),
+                )
+                if fb_text:
+                    text = fb_text
+                    conf = fb_conf
+                    source = f"batch_noise_fallback_{fb_source}"
+                else:
+                    source = "batch_greedy_noise_unfixed"
+
         line_items[line_idx]["vietocr_text"] = text.strip()
-        line_items[line_idx]["rec_conf"] = prob
-        line_items[line_idx]["rec_conf_source"] = "batch_greedy"
+        line_items[line_idx]["rec_conf"] = conf
+        line_items[line_idx]["rec_conf_source"] = source
 
     t_decode = time.time() - t_decode_start
 
@@ -427,7 +482,7 @@ def recognize_all_lines_batch(
     logger.info(
         f"VietOCR batch recognized {len(valid_tensor_indices)} lines in {total_time:.2f}s "
         f"(load={t_load:.2f}s prep={t_prep:.2f}s encode={t_encode:.2f}s "
-        f"decode={t_decode:.2f}s batch_size={batch_size})"
+        f"decode={t_decode:.2f}s batch_size={batch_size} fallback={fallback_count})"
     )
     return total_time
 

@@ -135,7 +135,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="Only run first N frames")
     parser.add_argument("--no_vintern", action="store_true", help="Disable Vintern fallback")
     parser.add_argument("--vietocr_batch_size", type=int, default=None, help="Override VietOCR CNN batch size")
-    parser.add_argument("--no_vietocr_batch", action="store_true", help="Disable VietOCR batch path")
+    parser.add_argument("--vietocr_batch", action="store_true", help="Enable experimental VietOCR batch decoder")
+    parser.add_argument("--no_vietocr_batch", action="store_true", help="Disable VietOCR batch decoder")
     parser.add_argument("--vintern_max_candidates", type=int, default=None, help="Max line crops sent to Vintern per frame")
     parser.add_argument("--vintern_group_max_candidates", type=int, default=None, help="Max group crops sent to Vintern per frame")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
@@ -169,6 +170,8 @@ def main() -> None:
         cfg["use_vintern_group_fallback"] = False
     if args.vietocr_batch_size is not None:
         cfg["vietocr_batch_size"] = args.vietocr_batch_size
+    if args.vietocr_batch:
+        cfg["vietocr_use_batch"] = True
     if args.no_vietocr_batch:
         cfg["vietocr_use_batch"] = False
     if args.vintern_max_candidates is not None:

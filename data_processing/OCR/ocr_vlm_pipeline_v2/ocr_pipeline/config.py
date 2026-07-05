@@ -49,9 +49,13 @@ def get_default_config() -> dict:
         # ── VietOCR ───────────────────────────────────────────────────
         "vietocr_config": "vgg_transformer",
         "vietocr_beamsearch": False,
-        "vietocr_use_batch": True,
+        "vietocr_use_batch": False,
         "vietocr_batch_size": 16,
         "vietocr_max_seq_length": 128,
+        "vietocr_batch_noise_fallback": True,
+        "vietocr_batch_fallback_prob_below": 0.35,
+        "vietocr_batch_fallback_min_text_len": 12,
+        "vietocr_batch_max_output_len_ratio": 0.75,
         "use_vietocr_return_prob": True,
         "rec_conf_fallback_when_missing": 0.50,
         "vietocr_device": None,  # auto-detect
@@ -104,6 +108,18 @@ def get_default_config() -> dict:
         "logo_y_ratio": 0.22,
         "logo_max_text_len": 10,
         "bottom_filter_y_ratio": 0.70,
+        "noise_filter_enabled": True,
+        "noise_filter_min_text_len": 18,
+        "noise_filter_min_alnum_len": 14,
+        "noise_filter_long_token_len": 18,
+        "noise_filter_long_token_unique_ratio": 0.35,
+        "noise_filter_max_unique_alnum_ratio": 0.28,
+        "noise_filter_min_top4_alnum_ratio": 0.82,
+        "noise_filter_max_avg_token_len_for_fragmented": 3.5,
+        "noise_filter_min_alpha_for_no_vowel": 8,
+        "noise_filter_max_no_vowel_ratio": 0.08,
+        "noise_filter_max_symbol_ratio": 0.38,
+        "noise_filter_symbol_max_unique_ratio": 0.40,
 
         # ── Vintern line fallback ─────────────────────────────────────
         "vintern_model_id": "5CD-AI/Vintern-1B-v3_5",
@@ -156,6 +172,7 @@ def get_default_config() -> dict:
         "line_crops_subdir": "ppocr_line_perspective_crops",
         "group_crops_subdir": "ppocr_stacked_group_crops",
         "output_suffix": "wordlist_gating_v2",
+        "es_include_review_in_search": False,
     }
 
 

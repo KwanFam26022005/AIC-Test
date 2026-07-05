@@ -250,6 +250,10 @@ def run_ocr_pipeline(
     # 12. Collect final texts
     # ══════════════════════════════════════════════════════════════════
     final_clean, final_review = collect_final_texts(groups)
+    status_counts = {}
+    for line in line_items:
+        status = line.get("filter_status", "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
     logger.info(f"Clean text: {len(final_clean)} chars")
     logger.info(f"Review text: {len(final_review)} chars")
 
@@ -341,6 +345,8 @@ def main():
     parser.add_argument("--image", required=True, help="Path to input frame image")
     parser.add_argument("--output_dir", default=None, help="Output directory")
     parser.add_argument("--no_vintern", action="store_true", help="Disable Vintern fallback")
+    parser.add_argument("--vietocr_batch", action="store_true", help="Enable experimental VietOCR batch decoder")
+    parser.add_argument("--no_vietocr_batch", action="store_true", help="Disable VietOCR batch decoder")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     args = parser.parse_args()
 
@@ -356,6 +362,10 @@ def main():
     if args.no_vintern:
         cfg["use_vintern_line_fallback"] = False
         cfg["use_vintern_group_fallback"] = False
+    if args.vietocr_batch:
+        cfg["vietocr_use_batch"] = True
+    if args.no_vietocr_batch:
+        cfg["vietocr_use_batch"] = False
 
     result = run_ocr_pipeline(args.image, cfg, args.output_dir)
 

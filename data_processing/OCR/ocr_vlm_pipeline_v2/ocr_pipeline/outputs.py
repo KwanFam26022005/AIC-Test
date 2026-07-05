@@ -23,6 +23,8 @@ import cv2
 import numpy as np
 import pandas as pd
 
+from .structural_filter import classify_noise_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -73,6 +75,18 @@ def build_group_text_clean_review(
                 num_vintern += 1
 
             final_text = (line.get("final_text") or "").strip()
+            noise_reason = classify_noise_text(final_text, cfg)
+            if noise_reason:
+                line["post_filter_status"] = "text_noise_filter"
+                line["noise_reason"] = noise_reason
+                line["is_filtered"] = True
+                line["filter_status"] = "text_noise_filter"
+                line["send_to_vintern"] = False
+                line["keep_for_index"] = False
+                line["need_review"] = False
+                line["final_source"] = "text_noise_filter"
+                num_filtered += 1
+                continue
 
             if line.get("keep_for_index", False) and final_text:
                 clean_lines.append(final_text)
@@ -148,6 +162,7 @@ def export_csv_lines(
         "priority", "filter_status", "send_to_vintern",
         "vintern_text", "vintern_composite_score", "agreement_similarity",
         "final_text", "final_source", "keep_for_index", "need_review",
+        "post_filter_status", "noise_reason", "vintern_noise_reason",
         "persp_crop_path", "group_crop_path", "bbox_xyxy",
     ]
 
@@ -181,6 +196,7 @@ def export_csv_groups(
         "group_vintern_text", "group_vintern_composite_score",
         "group_vintern_agreement_similarity",
         "group_final_source", "group_keep_for_index", "need_review",
+        "group_vintern_noise_reason",
         "group_crop_path", "bbox_xyxy",
         "mean_det_score", "mean_composite_score",
         "num_keep_lines", "num_vlm_candidates",
@@ -241,7 +257,7 @@ def build_es_document(
     """Build an ES-friendly frame OCR document.
 
     The top-level search fields are intentionally denormalized:
-    - ocr_text_search: clean + review text for broad recall
+    - ocr_text_search: clean/indexable text only by default
     - ocr_text_unaccent: accent-stripped search helper for Vietnamese fuzzy search
     - ocr_terms: normalized unique tokens for lazy autocomplete/filtering
 
@@ -257,15 +273,21 @@ def build_es_document(
     line_texts = [
         (line.get("final_text") or line.get("vietocr_text") or "").strip()
         for line in line_items
-        if (line.get("final_text") or line.get("vietocr_text") or "").strip()
+        if line.get("keep_for_index")
+        and (line.get("final_text") or line.get("vietocr_text") or "").strip()
+        and not classify_noise_text((line.get("final_text") or line.get("vietocr_text") or ""), cfg)
     ]
     group_texts = [
-        text.strip()
+        (group.get("group_text_clean") or "").strip()
         for group in groups
-        for text in (group.get("group_text_clean"), group.get("group_text_review"))
-        if isinstance(text, str) and text.strip()
+        if isinstance(group.get("group_text_clean"), str)
+        and group.get("group_text_clean", "").strip()
+        and not classify_noise_text(group.get("group_text_clean", ""), cfg)
     ]
-    search_text = _normalize_space("\n".join([clean_text, review_text, *group_texts, *line_texts]))
+    search_parts = [clean_text, *group_texts, *line_texts]
+    if cfg.get("es_include_review_in_search", False):
+        search_parts.append(review_text)
+    search_text = _normalize_space("\n".join(search_parts))
     search_unaccent = _strip_accents(search_text)
     terms = _extract_terms(search_unaccent)
 
@@ -276,6 +298,7 @@ def build_es_document(
         "review_chars": len(review_text),
         "num_keep_lines": sum(1 for line in line_items if line.get("keep_for_index")),
         "num_review_lines": sum(1 for line in line_items if line.get("need_review")),
+        "num_noise_filtered_lines": sum(1 for line in line_items if line.get("post_filter_status") == "text_noise_filter"),
         "num_vintern_lines": sum(1 for line in line_items if line.get("vintern_text")),
         "num_vlm_candidates": sum(1 for line in line_items if line.get("send_to_vintern")),
         "gating_stats": _count_values(line.get("filter_status", "unknown") for line in line_items),
@@ -304,6 +327,7 @@ def build_es_document(
             "fallback_vlm_group": cfg.get("vintern_model_id", "5CD-AI/Vintern-1B-v3_5"),
             "wordlist_enabled": True,
             "group_text_rule": "group_text_clean only; group_text_review is not indexed",
+            "search_text_rule": "ocr_text_search uses clean/indexable text only unless es_include_review_in_search=true",
         },
         "timing": timing or {},
         "quality": quality,
@@ -342,6 +366,7 @@ def _serialize_lines(line_items: list[dict]) -> list[dict]:
         "filter_status", "send_to_vintern", "vintern_text",
         "vintern_composite_score", "agreement_similarity",
         "final_text", "final_source", "keep_for_index", "need_review",
+        "post_filter_status", "noise_reason", "vintern_noise_reason",
         "bbox_xyxy", "persp_crop_path", "group_crop_path",
     ]
     result = []
@@ -362,6 +387,7 @@ def _serialize_groups(groups: list[dict]) -> list[dict]:
         "group_vintern_text", "group_vintern_composite_score",
         "group_vintern_agreement_similarity", "group_final_source",
         "group_keep_for_index", "need_review", "bbox_xyxy",
+        "group_vintern_noise_reason",
         "group_crop_path", "mean_det_score", "mean_composite_score",
         "mean_rec_conf", "num_keep_lines", "num_filtered_lines",
         "num_vlm_candidates", "num_vintern_lines", "group_vlm_priority",
@@ -459,6 +485,7 @@ _STATUS_COLORS = {
     "vlm_candidate": (255, 165, 0),    # Orange
     "structural_filter": (128, 128, 128),  # Gray
     "review_only": (255, 255, 0),      # Yellow
+    "text_noise_filter": (90, 90, 90),  # Dark gray
 }
 
 _SOURCE_COLORS = {

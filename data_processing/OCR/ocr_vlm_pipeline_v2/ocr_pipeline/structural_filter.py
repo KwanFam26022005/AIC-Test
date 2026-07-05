@@ -10,6 +10,8 @@ Filters:
 from __future__ import annotations
 
 import re
+import unicodedata
+from collections import Counter
 
 # ── Regex patterns ────────────────────────────────────────────────────
 
@@ -22,6 +24,18 @@ _60_GIAY_TOKENS = {
     "60", "69", "6o",
     "giây", "giay", "giấy", "gầy", "(gầy", "giy",
 }
+
+TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹĐđ]+(?:[-'][0-9A-Za-zÀ-ỹĐđ]+)*")
+
+_VOWELS = set(
+    "aeiouy"
+    "àáảãạăắằẳẵặâấầẩẫậ"
+    "èéẻẽẹêếềểễệ"
+    "ìíỉĩị"
+    "òóỏõọôốồổỗộơớờởỡợ"
+    "ùúủũụưứừửữự"
+    "ỳýỷỹỵ"
+)
 
 
 def is_empty(text: str) -> bool:
@@ -109,6 +123,82 @@ def is_bottom_counter(
     return False
 
 
+def _normalize_alnum_char(ch: str) -> str:
+    normalized = unicodedata.normalize("NFD", ch)
+    without_marks = "".join(c for c in normalized if unicodedata.category(c) != "Mn")
+    return without_marks.casefold()
+
+
+def classify_noise_text(text: str, cfg: dict | None = None) -> str | None:
+    """Detect OCR hallucination/noise text that should not be indexed.
+
+    This targets long low-diversity strings such as:
+    - AIIIAAIAIIII...
+    - 1B0CBC2BBC...
+    - NN1(N1N([N...
+
+    These are common OCR/VLM false positives from texture, borders, or signs.
+    Returns a short reason string when the text should be dropped.
+    """
+    cfg = cfg or {}
+    if not cfg.get("noise_filter_enabled", True):
+        return None
+
+    stripped = (text or "").strip()
+    min_text_len = int(cfg.get("noise_filter_min_text_len", 18))
+    if len(stripped) < min_text_len:
+        return None
+
+    chars = [ch for ch in stripped if not ch.isspace()]
+    if not chars:
+        return "empty"
+
+    alnum = [ch for ch in stripped if ch.isalnum()]
+    min_alnum = int(cfg.get("noise_filter_min_alnum_len", 14))
+    if len(alnum) < min_alnum:
+        symbol_ratio = sum(1 for ch in chars if not ch.isalnum()) / max(1, len(chars))
+        if symbol_ratio >= float(cfg.get("noise_filter_max_symbol_ratio", 0.38)):
+            return "symbol_heavy_noise"
+        return None
+
+    normalized_alnum = [_normalize_alnum_char(ch) for ch in alnum]
+    unique_ratio = len(set(normalized_alnum)) / max(1, len(normalized_alnum))
+    top4_ratio = sum(count for _, count in Counter(normalized_alnum).most_common(4)) / len(normalized_alnum)
+
+    tokens = TOKEN_RE.findall(stripped)
+    avg_token_len = sum(len(t) for t in tokens) / max(1, len(tokens))
+    long_token_len = int(cfg.get("noise_filter_long_token_len", 18))
+    long_token_unique_ratio = float(cfg.get("noise_filter_long_token_unique_ratio", 0.35))
+
+    for token in tokens:
+        token_alnum = [_normalize_alnum_char(ch) for ch in token if ch.isalnum()]
+        if len(token_alnum) < long_token_len:
+            continue
+        token_unique_ratio = len(set(token_alnum)) / max(1, len(token_alnum))
+        if token_unique_ratio <= long_token_unique_ratio:
+            return "low_diversity_long_token"
+
+    max_unique_ratio = float(cfg.get("noise_filter_max_unique_alnum_ratio", 0.28))
+    min_top4_ratio = float(cfg.get("noise_filter_min_top4_alnum_ratio", 0.82))
+    max_fragment_avg = float(cfg.get("noise_filter_max_avg_token_len_for_fragmented", 3.5))
+    if unique_ratio <= max_unique_ratio and top4_ratio >= min_top4_ratio:
+        if len(tokens) <= 2 or avg_token_len <= max_fragment_avg:
+            return "low_diversity_fragmented_text"
+
+    alpha = [_normalize_alnum_char(ch) for ch in alnum if ch.isalpha()]
+    if len(alpha) >= int(cfg.get("noise_filter_min_alpha_for_no_vowel", 8)):
+        vowel_ratio = sum(1 for ch in alpha if ch in _VOWELS) / max(1, len(alpha))
+        if vowel_ratio <= float(cfg.get("noise_filter_max_no_vowel_ratio", 0.08)):
+            return "no_vowel_alpha_noise"
+
+    symbol_ratio = sum(1 for ch in chars if not ch.isalnum()) / max(1, len(chars))
+    if symbol_ratio >= float(cfg.get("noise_filter_max_symbol_ratio", 0.38)):
+        if unique_ratio <= float(cfg.get("noise_filter_symbol_max_unique_ratio", 0.40)):
+            return "symbol_heavy_noise"
+
+    return None
+
+
 def classify_filter_status(
     line_item: dict,
     W: int,
@@ -132,6 +222,11 @@ def classify_filter_status(
         return "structural_filter"
 
     if is_timestamp(text):
+        return "structural_filter"
+
+    noise_reason = classify_noise_text(text, cfg)
+    if noise_reason:
+        line_item["noise_reason"] = noise_reason
         return "structural_filter"
 
     bbox = line_item.get("bbox_xyxy", [0, 0, 0, 0])
