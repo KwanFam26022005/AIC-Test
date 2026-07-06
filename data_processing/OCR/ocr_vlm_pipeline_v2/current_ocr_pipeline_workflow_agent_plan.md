@@ -1,538 +1,339 @@
-# Workflow hiện tại: PP-OCRv6 DET → VietOCR Wordlist Gating → Vintern Line/Group Fallback
+# Report: OCR VLM Pipeline v2 - Workflow hiện tại
 
-Tài liệu này mô tả chi tiết workflow hiện tại để agent có thể refactor/coding lại thành pipeline rõ ràng, có thể chạy trên 1 frame trước, sau đó mở rộng sang nhiều frame/video.
+Tài liệu này mô tả workflow thật đang được implement trong `ocr_vlm_pipeline_v2`, không còn là bản kế hoạch từ notebook. Pipeline hiện tại được thiết kế để:
 
-Notebook nguồn hiện tại:
+- Debug chất lượng trên 1 frame bằng `run_single_frame.py`.
+- Chạy batch trên folder frame/video bằng `run_frame_folder.py`.
+- Dùng PP-OCRv6 để detect text box.
+- Dùng VietOCR làm recognizer chính.
+- Dùng wordlist, composite score và structural filter để quyết định text nào đủ tin cậy.
+- Chỉ gửi các crop nghi ngờ sang Vintern VLM.
+- Xuất JSONL dạng ES-friendly để search/index.
+- Có script search local trước khi đưa dữ liệu vào Elasticsearch thật.
+
+Notebook gốc tham khảo:
 
 ```text
-ppocrv6_det_group_line_vietocr_vintern_wordlist_gating_v2.ipynb
+data_processing/OCR/ppocrv6_det_group_line_vietocr_vintern_wordlist_gating_v2.ipynb
 ```
 
-Mục tiêu chính của workflow:
+Code hiện tại:
 
 ```text
-1 frame ảnh
-→ detect text line bằng PP-OCRv6_medium_det
-→ crop từng line bằng perspective
-→ group các line-box gần/chồng nhau để giữ context
-→ OCR line bằng VietOCR
-→ đánh giá độ tin cậy bằng wordlist + composite score
-→ lọc logo/timestamp/60 giây/noise
-→ nếu line đáng nghi: gọi Vintern line fallback
-→ nếu group nhiều dòng đáng nghi: gọi Vintern group fallback
-→ chỉ đưa text đã accept vào group_text_clean / final_clean_text
-→ đưa text chưa chắc đúng vào group_text_review / final_review_text
-→ export CSV/JSON/TXT/visualization
+data_processing/OCR/ocr_vlm_pipeline_v2/
+├── run_single_frame.py
+├── run_frame_folder.py
+├── search_ocr_results.py
+└── ocr_pipeline/
+    ├── config.py
+    ├── detector.py
+    ├── cropping.py
+    ├── grouping.py
+    ├── structural_filter.py
+    ├── outputs.py
+    ├── recognizers/
+    │   ├── vietocr_recognizer.py
+    │   └── vintern_recognizer.py
+    └── scoring/
+        ├── features.py
+        ├── gating.py
+        └── wordlist.py
 ```
 
 ---
 
-## 1. Vấn đề pipeline đang giải quyết
+## 1. Mục tiêu workflow
 
-### 1.1. Không thể gửi tất cả crop sang VLM
-
-Với quy mô lớn:
+Pipeline không phải là chuỗi OCR đơn giản. Nó là một **OCR confidence funnel**:
 
 ```text
-~1M frame × ~10 dòng/frame ≈ 10M line crops
+Frame gốc
+-> PP-OCRv6 detect text boxes
+-> crop từng line
+-> group các line gần nhau
+-> VietOCR đọc tất cả line crop
+-> wordlist + feature scoring
+-> structural/noise filter
+-> gating:
+   - auto_accept
+   - vlm_candidate
+   - structural_filter
+   - review_only
+-> Vintern đọc line/group crop nếu cần
+-> tạo clean text và review text
+-> export CSV/TXT/PNG/JSON hoặc JSONL batch
+-> search local hoặc index ES
 ```
 
-Nếu mọi line đều gửi sang Vintern/VLM thì chi phí GPU rất cao. Vì vậy pipeline cần một tầng **gating** để phân loại:
+Nguyên tắc quan trọng:
 
 ```text
-auto_accept       → đủ tin cậy, không gửi VLM
-vlm_candidate     → nghi ngờ, cần line/group Vintern
-structural_filter → logo/time/counter/noise, bỏ qua
-review_only       → chưa đủ chắc để index
-```
-
-### 1.2. VietOCR đọc khá tốt tiếng Việt nhưng không luôn có confidence
-
-Trong notebook hiện tại, VietOCR được gọi với:
-
-```python
-vietocr_predictor.predict(crop, return_prob=True)
-```
-
-Tuy nhiên tùy version/config, output có thể là:
-
-```text
-(text, prob)
-[text, prob]
-text only
-return_prob_missing
-return_prob_no_conf
-```
-
-Nếu không lấy được confidence thật, pipeline dùng fallback:
-
-```python
-rec_conf = 0.50
-```
-
-và bật logic riêng cho trường hợp `rec_conf_flat/missing`.
-
-### 1.3. Text review không được index
-
-Trước đây có lỗi nguy hiểm:
-
-```text
-group_text = clean_text if clean_text else review_text
-```
-
-Điều này khiến text chưa được accept vẫn lọt vào index. Bản hiện tại sửa thành:
-
-```text
-group_text_clean  → chỉ chứa text đã accept
-group_text_review → chứa text nghi ngờ để debug/manual review
-group_text        → bằng group_text_clean, KHÔNG fallback sang review
+Chỉ `clean text` được dùng cho search/index chính.
+`review text` chỉ dùng để debug, audit hoặc search phụ khi cần.
+Không được fallback group_text sang review_text.
 ```
 
 ---
 
-## 2. Kiến trúc tổng quan
+## 2. Entry points
+
+### 2.1. Debug 1 frame
+
+File:
 
 ```text
-┌──────────────────────────┐
-│ Input frame image         │
-└─────────────┬────────────┘
-              │
-              v
-┌──────────────────────────┐
-│ PP-OCRv6_medium_det       │
-│ Output: line polygons     │
-└─────────────┬────────────┘
-              │
-              v
-┌──────────────────────────┐
-│ Validate / filter boxes   │
-│ min_width, min_height     │
-│ aspect ratio, det_score   │
-└─────────────┬────────────┘
-              │
-              v
-┌──────────────────────────┐
-│ Perspective crop line     │
-│ Save line crop            │
-└─────────────┬────────────┘
-              │
-              v
-┌──────────────────────────┐
-│ Group nearby/stacked lines│
-│ Save group crop context   │
-└─────────────┬────────────┘
-              │
-              v
-┌──────────────────────────┐
-│ VietOCR line recognition  │
-│ Try return_prob=True      │
-└─────────────┬────────────┘
-              │
-              v
-┌──────────────────────────┐
-│ Wordlist + feature score  │
-│ lex_ratio, diacritic_susp │
-│ charset_penalty, det_score│
-│ composite_score           │
-└─────────────┬────────────┘
-              │
-              v
-┌──────────────────────────┐
-│ Gating decision           │
-│ auto_accept / VLM / filter│
-└──────┬──────────────┬─────┘
-       │              │
-       │              v
-       │       ┌────────────────────┐
-       │       │ Vintern line OCR    │
-       │       │ if line suspicious  │
-       │       └──────────┬─────────┘
-       │                  │
-       v                  v
-┌──────────────────────────────────┐
-│ Update line final_text/source     │
-│ keep_for_index / need_review      │
-└────────────────┬─────────────────┘
-                 │
-                 v
-┌──────────────────────────────────┐
-│ Vintern group OCR                 │
-│ if multi-line group suspicious    │
-└────────────────┬─────────────────┘
-                 │
-                 v
-┌──────────────────────────────────┐
-│ group_text_clean / review         │
-│ final_clean_text / review_text    │
-└────────────────┬─────────────────┘
-                 │
-                 v
-┌──────────────────────────────────┐
-│ Export CSV / JSON / TXT / Image   │
-└──────────────────────────────────┘
+run_single_frame.py
 ```
 
----
+Dùng khi cần xem kỹ:
 
-## 3. Modules agent nên tách ra
+- detector có bắt đúng text không
+- crop có cắt mất chữ/dấu không
+- VietOCR đọc gì
+- line/group nào bị gửi Vintern
+- clean/review text ra sao
+- visualization PNG có hợp lý không
 
-Agent nên refactor notebook thành các module/function riêng:
+Lệnh mẫu trên server:
+
+```bash
+cd /tmp2/maitanha/vgu/ttn/AIC-Khoa/AIC-Test/data_processing/OCR/ocr_vlm_pipeline_v2
+
+CUDA_VISIBLE_DEVICES=0 OCR_V2_PADDLE_DEVICE=gpu:0 OCR_V2_PADDLE_ENGINE=paddle_dynamic OCR_V2_VINTERN_ATTN=flash_attention_2 \
+python run_single_frame.py \
+  --image /tmp2/maitanha/vgu/ttn/data/AIC2025/keyframes/Keyframes_L27/L27_V010/050.jpg \
+  --output_dir ./outputs_test/L27_V010_050 \
+  --verbose
+```
+
+Test nhanh không chạy Vintern:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 OCR_V2_PADDLE_DEVICE=gpu:0 OCR_V2_PADDLE_ENGINE=paddle_dynamic \
+python run_single_frame.py \
+  --image /tmp2/maitanha/vgu/ttn/data/AIC2025/keyframes/Keyframes_L27/L27_V010/050.jpg \
+  --output_dir ./outputs_test/L27_V010_050_no_vintern \
+  --no_vintern \
+  --verbose
+```
+
+### 2.2. Chạy batch một video/folder frame
+
+File:
 
 ```text
-ocr_pipeline/
-├── config.py
-├── detector.py
-├── cropping.py
-├── grouping.py
-├── recognizers/
-│   ├── vietocr_recognizer.py
-│   └── vintern_recognizer.py
-├── scoring/
-│   ├── wordlist.py
-│   ├── features.py
-│   └── gating.py
-├── outputs.py
-└── run_single_frame.py
+run_frame_folder.py
 ```
 
-Hoặc nếu giữ trong notebook, vẫn nên tổ chức theo các cell tương ứng.
+Dùng khi đã tin pipeline ổn trên vài frame và muốn chạy cả video.
 
----
+Lệnh khuyến nghị cho `L22_V012`:
 
-## 4. Cấu hình chính
+```bash
+cd /tmp2/maitanha/vgu/ttn/AIC-Khoa/AIC-Test/data_processing/OCR/ocr_vlm_pipeline_v2
 
-### 4.1. Detector config
-
-```python
-CONFIG = {
-    "det_model_name": "PP-OCRv6_medium_det",
-    "det_limit_type": "min",
-    "det_limit_side_len": 960,
-    "det_thresh": 0.30,
-    "det_box_thresh": 0.50,
-    "det_unclip_ratio": 1.8,
-}
+CUDA_VISIBLE_DEVICES=0 OCR_V2_PADDLE_DEVICE=gpu:0 OCR_V2_PADDLE_ENGINE=paddle_dynamic OCR_V2_VINTERN_ATTN=flash_attention_2 \
+python run_frame_folder.py \
+  --frames_dir ../../../keyframe_test/L22_V012 \
+  --output_dir ./outputs_video \
+  --video_id L22_V012_full_w4 \
+  --pattern "*.jpg" \
+  --workers 4 \
+  --no_vietocr_batch \
+  --batch_artifacts minimal \
+  --cleanup_crops \
+  --quiet
 ```
 
-Ý nghĩa:
+Ý nghĩa các flag:
 
-| Tham số | Vai trò |
+| Flag | Ý nghĩa |
 |---|---|
-| `det_limit_side_len` | Resize ảnh đầu vào cho detector. Tăng lên 1216 nếu miss chữ nhỏ. |
-| `det_thresh` | Ngưỡng pixel text confidence. Giảm nếu miss text. |
-| `det_box_thresh` | Ngưỡng box confidence. Giảm nếu miss box, tăng nếu quá nhiều noise. |
-| `det_unclip_ratio` | Nới box text. Tăng nếu crop bị cắt dấu/chữ. |
-
-### 4.2. Line box filtering
-
-```python
-"drop_low_det_score_below": 0.0,
-"min_box_width": 10,
-"min_box_height": 8,
-"min_box_aspect_ratio": 0.25,
-```
-
-Mục tiêu: loại box quá nhỏ/không hợp lệ trước khi crop/OCR.
-
-### 4.3. Perspective crop config
-
-```python
-"perspective_padding": 12,
-"crop_min_height_for_ocr": 72,
-"crop_upscale_max_factor": 3.5,
-"add_white_border": 10,
-"contrast_factor": 1.25,
-```
-
-Mục tiêu: chuẩn hóa line crop cho VietOCR/Vintern.
-
-Luồng xử lý:
-
-```text
-polygon box
-→ order points
-→ expand polygon bằng padding
-→ perspective transform
-→ upscale nếu height thấp
-→ tăng contrast
-→ thêm white border
-→ save crop
-```
-
-### 4.4. Grouping config
-
-```python
-"group_min_x_overlap_ratio": 0.12,
-"group_max_vertical_gap_ratio": 1.80,
-"group_min_lines": 2,
-"group_crop_padding": 28,
-```
-
-Mục tiêu: group các dòng text thuộc cùng block/context.
-
-Ví dụ:
-
-```text
-ĐƯỜNG
-VÕ VĂN KIỆT
-```
-
-Hai line này nên nằm cùng group để Vintern group-crop có đủ context.
-
-### 4.5. VietOCR config
-
-```python
-"vietocr_config": "vgg_transformer",
-"vietocr_beamsearch": True,
-"use_vietocr_return_prob": True,
-"rec_conf_fallback_when_missing": 0.50,
-```
-
-Nếu `return_prob=True` không hoạt động, pipeline sẽ gán:
-
-```python
-rec_conf = 0.50
-rec_conf_source = "return_prob_missing" hoặc "text_only"
-```
-
-Sau đó dùng rule riêng cho trường hợp confidence missing/flat.
-
-### 4.6. Wordlist config
-
-```python
-"wordlist_paths": [
-    "/content/drive/MyDrive/vietnamese/vn_dictionary.txt",
-    "/content/drive/MyDrive/vietnamese/general_dict.txt",
-    "/content/vn_dictionary.txt",
-    "/content/general_dict.txt",
-],
-"wordlist_min_entries_to_enable": 1000,
-"neutral_lex_ratio_if_no_wordlist": 0.50,
-```
-
-`vn_dictionary.txt` và `general_dict.txt` dùng để tạo:
-
-```python
-VN_WORDSET
-VN_BASE_TO_VARIANTS
-```
-
-Trong đó:
-
-```text
-VN_WORDSET:
-  tập token hợp lệ
-
-VN_BASE_TO_VARIANTS:
-  token không dấu → các biến thể có dấu hợp lệ
-```
-
-Ví dụ:
-
-```text
-"van" → {"văn", "vân", "vạn", ...}
-"kiet" → {"kiệt", ...}
-```
+| `--workers 4` | Chạy 4 process song song. Mỗi worker load detector, VietOCR, Vintern riêng. |
+| `--no_vietocr_batch` | Dùng official VietOCR predict path ổn định hơn. Batch decoder hiện là experimental. |
+| `--batch_artifacts minimal` | Chỉ ghi JSONL + summary, không ghi CSV/TXT/PNG từng frame. |
+| `--cleanup_crops` | Xóa line/group crops sau mỗi frame để tránh đầy disk. |
+| `--quiet` | Giảm log rác từ Paddle/VietOCR/Transformers. |
+| `OCR_V2_VINTERN_ATTN=flash_attention_2` | Ưu tiên FlashAttention nếu import được, code sẽ fallback nếu lỗi. |
 
 ---
 
-## 5. Data structures
+## 3. Runtime environment trên server
 
-### 5.1. `line_item`
+Env đang dùng:
 
-Mỗi detected line nên lưu dạng dict:
-
-```python
-line_item = {
-    "line_id": int,
-    "det_idx": int,
-    "box": [[x, y], [x, y], [x, y], [x, y]],
-    "bbox_xyxy": [x1, y1, x2, y2],
-    "det_score": float,
-
-    "persp_crop_path": str,
-    "group_id": int | None,
-    "group_crop_path": str | None,
-
-    "vietocr_text": str,
-    "rec_conf": float,
-    "rec_conf_source": str,
-    "rec_conf_flat_run": bool,
-
-    "lex_ratio": float,
-    "diacritic_susp": float,
-    "charset_penalty": float,
-    "repetition_penalty": float,
-    "det_score_norm": float,
-    "composite_score": float,
-    "quality_score": float,
-    "priority": float,
-
-    "tokens": list[str],
-    "eval_tokens": list[str],
-    "diacritic_suspicious_tokens": list[str],
-    "oov_tokens": list[str],
-
-    "filter_status": str,
-    "send_to_vintern": bool,
-    "is_filtered": bool,
-
-    "vintern_text": str | None,
-    "vintern_composite_score": float | None,
-    "agreement_similarity": float | None,
-
-    "final_text": str,
-    "final_source": str,
-    "keep_for_index": bool,
-    "need_review": bool,
-
-    "group_text": str,
-    "group_text_review": str,
-}
+```text
+/tmp2/maitanha/vgu/ttn/AIC-Khoa/conda_envs/aic-detect-gpu
 ```
 
-### 5.2. `group`
+Biến môi trường quan trọng:
 
-Mỗi group chứa nhiều line:
-
-```python
-group = {
-    "group_id": int,
-    "reading_order": int,
-    "line_indices": list[int],
-    "num_lines": int,
-    "is_multiline_group": bool,
-
-    "bbox_xyxy": [x1, y1, x2, y2],
-    "group_crop_path": str,
-
-    "group_text_clean": str,
-    "group_text_review": str,
-    "group_text": str,
-    "group_text_lines": list[str],
-    "group_review_lines": list[str],
-
-    "num_keep_lines": int,
-    "num_filtered_lines": int,
-    "num_vlm_candidates": int,
-    "num_vintern_lines": int,
-
-    "mean_det_score": float,
-    "mean_composite_score": float,
-    "mean_rec_conf": float,
-    "group_vlm_priority": float,
-
-    "group_vintern_text": str | None,
-    "group_vintern_composite_score": float | None,
-    "group_vintern_agreement_similarity": float | None,
-    "group_final_source": str | None,
-    "group_keep_for_index": bool | None,
-
-    "need_review": bool,
-}
+```bash
+CUDA_VISIBLE_DEVICES=0
+OCR_V2_PADDLE_DEVICE=gpu:0
+OCR_V2_PADDLE_ENGINE=paddle_dynamic
+OCR_V2_VINTERN_ATTN=flash_attention_2
 ```
+
+Ghi chú:
+
+- `CUDA_VISIBLE_DEVICES=0` chọn GPU vật lý.
+- Bên trong process, Paddle/Torch thấy GPU đó là `gpu:0` hoặc `cuda:0`.
+- Nếu đổi sang GPU 7 thì dùng `CUDA_VISIBLE_DEVICES=7`, vẫn giữ `OCR_V2_PADDLE_DEVICE=gpu:0`.
+- `paddle_dynamic` đang được dùng để tránh một số lỗi cuDNN/static trên server.
+- Nếu `flash_attention_2` không khả dụng hoặc ABI lỗi, Vintern loader sẽ fallback theo thứ tự `sdpa`, rồi `eager`.
 
 ---
 
-## 6. Detection stage
+## 4. Workflow chi tiết của 1 frame
 
-### 6.1. Input
+### 4.1. Load image và wordlist
 
-```python
-IMAGE_PATH = "/content/frame.jpg"
-img_rgb = cv2.cvtColor(cv2.imread(IMAGE_PATH), cv2.COLOR_BGR2RGB)
-H, W = img_rgb.shape[:2]
+`run_ocr_pipeline()` đọc ảnh bằng OpenCV:
+
+```text
+image_path -> cv2.imread -> BGR -> RGB
 ```
 
-### 6.2. Detector
+Wordlist được load từ:
 
-```python
-detector = TextDetection(
-    model_name="PP-OCRv6_medium_det",
-    device=PADDLE_DEVICE,
-    engine="paddle_static",
-    limit_side_len=CONFIG["det_limit_side_len"],
-    limit_type=CONFIG["det_limit_type"],
-    thresh=CONFIG["det_thresh"],
-    box_thresh=CONFIG["det_box_thresh"],
-    unclip_ratio=CONFIG["det_unclip_ratio"],
-    enable_mkldnn=False,
-    cpu_threads=4,
-)
+```text
+word_list/vn_dictionary.txt
+word_list/general_dict.txt
 ```
 
-### 6.3. Output parse
+Wordlist dùng để tính:
 
-Detector output cần parse ra:
+- `lex_ratio`
+- token OOV
+- nghi lỗi dấu tiếng Việt
+- composite score
 
-```python
-boxes: list[np.ndarray]  # shape [4, 2]
-det_scores: list[float]
+Nếu wordlist không đủ lớn, pipeline vẫn chạy nhưng dùng `neutral_lex_ratio_if_no_wordlist = 0.50`.
+
+### 4.2. PP-OCRv6 detection
+
+Module:
+
+```text
+ocr_pipeline/detector.py
 ```
 
-Agent cần implement function:
+Model chính:
 
-```python
-def parse_text_detection_output(det_output) -> tuple[list[np.ndarray], list[float]]:
-    ...
+```text
+PP-OCRv6_medium_det
 ```
 
-Nên hỗ trợ các field:
+Config mặc định:
+
+```python
+det_limit_side_len = 960
+det_thresh = 0.30
+det_box_thresh = 0.50
+det_unclip_ratio = 1.8
+```
+
+Detector loader thử nhiều API để tương thích version:
+
+```text
+paddleocr.TextDetection
+-> paddlex.TextDetection
+-> PaddleOCR end-to-end detector
+-> paddlex.create_model
+```
+
+Output detector được parse từ nhiều field có thể gặp:
 
 ```text
 dt_polys
 rec_polys
 boxes
+polys
 dt_scores
 scores
 ```
 
----
+### 4.3. Filter box detect
 
-## 7. Cropping stage
-
-### 7.1. Line crop
-
-Mỗi polygon box được crop bằng perspective transform:
-
-```python
-line_crop = crop_perspective_line(img_rgb, box, pad=CONFIG["perspective_padding"])
-line_crop = prepare_crop_for_ocr(
-    line_crop,
-    min_height=CONFIG["crop_min_height_for_ocr"],
-    max_upscale_factor=CONFIG["crop_upscale_max_factor"],
-    border=CONFIG["add_white_border"],
-    contrast_factor=CONFIG["contrast_factor"],
-)
-```
-
-Save crop:
+Pipeline lọc raw boxes theo:
 
 ```text
-/content/ppocr_line_perspective_crops/line_000_persp.png
+det_score
+min_box_width
+min_box_height
+min_box_aspect_ratio
 ```
 
-### 7.2. Group crop
-
-Sau khi group line boxes, crop group bằng axis-aligned bbox:
-
-```python
-group_crop = crop_axis_from_bbox(img_rgb, group_bbox_xyxy, pad=CONFIG["group_crop_padding"])
-```
-
-Save crop:
+Điểm fix quan trọng so với bản cũ:
 
 ```text
-/content/ppocr_stacked_group_crops/group_000.png
+box_aspect = width / height
 ```
 
-Group crop dùng cho Vintern group fallback.
+Không dùng:
 
----
+```text
+min(width, height) / max(width, height)
+```
 
-## 8. Grouping stage
+Lý do: subtitle/ticker thường rất dài và mỏng. Nếu dùng `min/max`, các box này bị drop nhầm dù detector đã detect đúng.
 
-### 8.1. Điều kiện group 2 line
+Mỗi line item giữ thêm:
+
+```text
+box_width
+box_height
+box_aspect
+box_thinness
+```
+
+Log debug có thể cho biết số box bị drop theo reason:
+
+```text
+After filtering: N valid lines (dropped M, reasons={...})
+```
+
+### 4.4. Perspective line crop
+
+Module:
+
+```text
+ocr_pipeline/cropping.py
+```
+
+Với mỗi detected line:
+
+```text
+polygon box
+-> perspective crop
+-> resize/upscale nếu quá thấp
+-> tăng contrast
+-> thêm white border
+-> save vào ppocr_line_perspective_crops/
+```
+
+Config:
+
+```python
+perspective_padding = 12
+crop_min_height_for_ocr = 72
+crop_upscale_max_factor = 3.5
+add_white_border = 10
+contrast_factor = 1.25
+```
+
+Line crop là input chính của VietOCR và Vintern line fallback.
+
+### 4.5. Grouping line boxes
+
+Module:
+
+```text
+ocr_pipeline/grouping.py
+```
+
+Mục tiêu: gộp các line gần nhau thành một text block để Vintern có context.
 
 Hai line được group nếu:
 
@@ -541,254 +342,179 @@ x_overlap_ratio >= group_min_x_overlap_ratio
 vertical_gap <= avg_line_height * group_max_vertical_gap_ratio
 ```
 
-Pseudo-code:
+Config:
 
 ```python
-def should_group_lines(a, b):
-    x_ov = x_overlap_ratio(a["bbox_xyxy"], b["bbox_xyxy"])
-    y_gap = vertical_gap(a["bbox_xyxy"], b["bbox_xyxy"])
-    avg_h = (height(a) + height(b)) / 2
-
-    return (
-        x_ov >= CONFIG["group_min_x_overlap_ratio"]
-        and y_gap <= avg_h * CONFIG["group_max_vertical_gap_ratio"]
-    )
+group_min_x_overlap_ratio = 0.12
+group_max_vertical_gap_ratio = 1.80
+group_min_lines = 2
+group_crop_padding = 28
 ```
 
-Sau đó dùng Union-Find để nối các line thành group.
-
-### 8.2. Reading order
-
-Group sort theo:
-
-```python
-(reading_order_y, reading_order_x)
-```
-
-Line trong group cũng sort top-to-bottom, left-to-right.
-
----
-
-## 9. VietOCR recognition stage
-
-### 9.1. Gọi VietOCR
-
-```python
-text, rec_conf, rec_conf_source = vietocr_predict_with_conf(crop)
-```
-
-Wrapper cần xử lý:
-
-```python
-out = vietocr_predictor.predict(crop, return_prob=True)
-```
-
-Các case:
+Implementation dùng Union-Find. Mỗi group có:
 
 ```text
-(text, prob)         → rec_conf_source = return_prob_valid
-[text, prob]         → rec_conf_source = return_prob_list_valid
-text only            → rec_conf_source = return_prob_no_conf
-missing confidence   → rec_conf_source = return_prob_missing
-exception/type error → fallback predict(crop)
+group_id
+reading_order
+line_indices
+num_lines
+is_multiline_group
+bbox_xyxy
+group_crop_path
 ```
 
-Nếu không có confidence:
+Group crop là input của Vintern group fallback.
 
-```python
-rec_conf = None
-```
+### 4.6. VietOCR recognition
 
-Sau đó trong scoring:
-
-```python
-rec_conf_norm = CONFIG["rec_conf_fallback_when_missing"]  # default 0.50
-```
-
-### 9.2. Detect rec_conf flat
-
-Sau khi nhận diện tất cả line:
-
-```python
-rec_conf_flat = (
-    std(rec_confs) <= rec_conf_flat_std_threshold
-    or unique_ratio <= rec_conf_flat_unique_ratio_threshold
-)
-```
-
-Nếu `rec_conf_flat=True`, set cho từng line:
-
-```python
-line["rec_conf_flat_run"] = True
-```
-
-và recompute gating bằng rule `rec_missing`.
-
----
-
-## 10. Wordlist + lexical features
-
-### 10.1. Tokenization
-
-```python
-TOKEN_RE = r"[0-9A-Za-zÀ-ỹĐđ]+(?:[-'][0-9A-Za-zÀ-ỹĐđ]+)*"
-```
-
-Text OCR được tách thành token:
-
-```python
-tokens = extract_tokens(text)
-eval_tokens = [t for t in tokens if len(t) >= 2 and not t.isdigit()]
-```
-
-### 10.2. `lex_ratio`
-
-```python
-lex_ratio = số eval_token nằm trong VN_WORDSET / tổng eval_token
-```
-
-Nếu không có wordlist đủ lớn:
-
-```python
-lex_ratio = neutral_lex_ratio_if_no_wordlist  # default 0.50
-```
-
-### 10.3. `diacritic_susp`
-
-Nếu token không khớp wordlist nhưng bản không dấu của token tồn tại trong `VN_BASE_TO_VARIANTS`:
+Module:
 
 ```text
-token = "nguoi"
-base = "nguoi"
-base tồn tại, nhưng "nguoi" không phải variant hợp lệ/có dấu
-→ nghi lỗi dấu
+ocr_pipeline/recognizers/vietocr_recognizer.py
 ```
 
-Tính:
+Config chính:
 
 ```python
-diacritic_susp = len(diacritic_suspicious_tokens) / len(eval_tokens)
+vietocr_config = "vgg_transformer"
+vietocr_beamsearch = False
+vietocr_use_batch = False
+vietocr_batch_size = 16
+use_vietocr_return_prob = True
 ```
 
-### 10.4. `charset_penalty`
+Mặc định hiện tại dùng official `Predictor.predict()` từng crop vì ổn định hơn.
 
-```python
-charset_penalty = số ký tự không thuộc allowed charset / tổng ký tự
-```
-
-Dùng để phạt ký tự lạ/rác.
-
-### 10.5. `repetition_penalty`
-
-Phạt chuỗi lặp token/ký tự, ví dụ:
+Pipeline có hỗ trợ experimental batch path:
 
 ```text
-"PP PP PP"
-"aaaaaa"
+batch CNN encode
+-> sequential greedy decode
+-> detect suspicious output
+-> fallback về official Predictor nếu output nhiễu
 ```
 
----
+Tuy nhiên khi chạy thật nên giữ:
 
-## 11. Composite score
-
-### 11.1. Formula hiện tại
-
-```python
-score = bias
-score += 0.42 * rec_conf
-score += 0.18 * det_score
-score += 0.22 * lex_ratio
-score += -0.12 * diacritic_susp
-score += -0.06 * charset_penalty
-score += -0.08 * repetition_penalty
-score = clip(score, 0, 1)
+```bash
+--no_vietocr_batch
 ```
 
-Output:
-
-```python
-composite_score = score
-quality_score = score * 100
-```
-
-### 11.2. Priority cho VLM
-
-```python
-priority = (1 - composite_score) + content_value_weight * content_value
-```
-
-Trong đó `content_value` tăng nhẹ theo số token/độ dài text.
-
-Ý nghĩa:
+vì batch decoder từng tạo các chuỗi nhiễu kiểu:
 
 ```text
-composite_score thấp → nghi ngờ → priority cao
-text có nội dung dài hơn → priority tăng nhẹ
+AIIIAAIAIIII...
+1B0CBC2BBC...
+NN1(N1N...
 ```
 
-Vintern candidates được sort giảm dần theo `priority`.
+### 4.7. rec_conf flat/missing detection
 
----
-
-## 12. Structural filter
-
-Các text bị bỏ qua trước khi xét VLM:
+VietOCR không phải lúc nào cũng trả confidence thật. Pipeline xử lý nhiều output format:
 
 ```text
-empty
-timestamp
-top-right logo
-bottom counter
-60 giây variants
+(text, prob) -> return_prob_valid
+[text, prob] -> return_prob_list_valid
+text only -> return_prob_no_conf
+missing -> return_prob_missing
+error -> error
 ```
 
-### 12.1. Timestamp
+Nếu confidence không có:
+
+```python
+rec_conf_fallback_when_missing = 0.50
+```
+
+Sau khi chạy toàn bộ line, pipeline kiểm tra `rec_conf_flat`:
 
 ```text
-18:48:36
-18.48.36
-06:31
+std(rec_conf) <= 0.02
+hoặc unique_ratio <= 0.10
 ```
 
-### 12.2. Top-right logo
+Nếu flat/missing, gating sẽ chuyển sang rule thận trọng hơn.
 
-Điều kiện:
+### 4.8. Structural filter và noise filter
 
-```python
-x1 > W * 0.72 and y2 < H * 0.22 and len(text) <= 10
-```
-
-### 12.3. 60 giây / bottom counter
-
-Các biến thể:
+Module:
 
 ```text
-60
-69
-6o
-giây
-giay
-giấy
-gầy
-(gầy
-giy
+ocr_pipeline/structural_filter.py
 ```
 
-Chỉ filter cứng nếu nằm ở lower-third:
+Filter loại bỏ trước khi index:
 
-```python
-y1 >= H * 0.70
+- empty text
+- timestamp
+- logo/watermark góc phải trên
+- bottom counter
+- biến thể `60 giây`
+- text nhiễu dài ít diversity
+- chuỗi nhiều symbol
+- chuỗi không có vowel bất thường
+
+Noise filter cũng được chạy sau khi có `final_text` để chặn hallucination từ OCR/VLM.
+
+Ví dụ noise bị chặn:
+
+```text
+AIIIAAIAIIIIIIIAAAA...
+1B0CBC2BBCBGCBGG...
+NN1(N1N([N...
 ```
 
----
+### 4.9. Scoring và gating
 
-## 13. Gating decision
+Module:
 
-### 13.1. Standard rule khi `rec_conf` đáng tin
+```text
+ocr_pipeline/scoring/gating.py
+ocr_pipeline/scoring/features.py
+ocr_pipeline/scoring/wordlist.py
+```
 
-Auto accept nếu:
+Mỗi line được tính:
+
+```text
+tokens
+eval_tokens
+lex_ratio
+diacritic_susp
+oov_tokens
+charset_penalty
+repetition_penalty
+det_score_norm
+composite_score
+quality_score
+priority
+```
+
+Composite score mặc định:
 
 ```python
+score =
+  0.42 * rec_conf
+  + 0.18 * det_score
+  + 0.22 * lex_ratio
+  - 0.12 * diacritic_susp
+  - 0.06 * charset_penalty
+  - 0.08 * repetition_penalty
+```
+
+Gating statuses:
+
+| Status | Ý nghĩa |
+|---|---|
+| `auto_accept` | VietOCR đủ tin cậy, đưa vào clean text. |
+| `vlm_candidate` | Nghi ngờ, gửi sang Vintern nếu nằm trong top candidates. |
+| `structural_filter` | Bỏ qua, không index, không review. |
+| `review_only` | Có text nhưng vẫn cần review. |
+| `text_noise_filter` | Bị loại sau khi phát hiện noise/hallucination. |
+
+Với `rec_conf` đáng tin, auto-accept cần:
+
+```text
 rec_conf >= 0.90
 det_score >= 0.70
 lex_ratio >= 0.50
@@ -796,56 +522,56 @@ diacritic_susp <= 0.00
 charset_penalty <= 0.05
 ```
 
-Escalate nếu:
+Với `rec_conf` missing/flat, auto-accept thận trọng hơn:
 
-```python
-weak_detection == True
-or composite_score < 0.68
-or rec_conf < 0.85
-or lex_ratio < 0.45
-or diacritic_susp > 0.30
-```
-
-### 13.2. Rule riêng khi `rec_conf` missing/flat
-
-Nếu confidence không đáng tin, không auto-accept line ngắn.
-
-Auto accept chỉ khi:
-
-```python
+```text
 token_count >= 5
 det_score >= 0.78
 lex_ratio >= 0.70
 diacritic_susp <= 0.05
 charset_penalty <= 0.02
-weak_detection == False
 ```
 
-Nếu không thỏa:
+### 4.10. Vintern VLM fallback
+
+Module:
 
 ```text
-vlm_candidate
+ocr_pipeline/recognizers/vintern_recognizer.py
 ```
 
-Mục tiêu:
+Model mặc định hiện tại:
 
 ```text
-ticker/caption dài, rõ, lex tốt → có thể auto_accept
-biển đường/tên riêng ngắn → không auto_accept, gửi Vintern group
+5CD-AI/Vintern-1B-v3_5
 ```
 
----
-
-## 14. Vintern line fallback
-
-### 14.1. Candidate selection
+Config:
 
 ```python
-vlm_candidates = [line for line in line_items if line["send_to_vintern"]]
-candidates = sorted(vlm_candidates, key=lambda x: -x["priority"])[:vintern_max_candidates]
+vintern_quantization = "4bit_nf4"
+vintern_input_size = 448
+vintern_max_tiles = 4
+vintern_max_new_tokens = 256
+vintern_do_sample = False
 ```
 
-### 14.2. OCR prompt
+Vintern nhận input là:
+
+```text
+image crop + prompt
+```
+
+Có 2 loại crop:
+
+| Loại input | Nguồn | Khi dùng |
+|---|---|---|
+| Line crop | `ppocr_line_perspective_crops/` | Một dòng bị nghi ngờ. |
+| Group crop | `ppocr_stacked_group_crops/` | Cụm nhiều dòng cần context. |
+
+Vintern không tự detect text box. Nó chỉ OCR vùng crop đã đưa vào.
+
+Line prompt:
 
 ```text
 Hãy đọc chính xác toàn bộ chữ trong ảnh crop này.
@@ -853,91 +579,7 @@ Chỉ trả về nội dung OCR, không giải thích.
 Giữ nguyên tiếng Việt có dấu nếu có.
 ```
 
-### 14.3. Vintern preprocessing
-
-Vintern dùng `dynamic_preprocess`:
-
-```text
-PIL image
-→ chọn tile layout theo aspect ratio
-→ resize mỗi tile về 448×448
-→ normalize ImageNet mean/std
-→ stack tensor [num_tiles, 3, 448, 448]
-```
-
-Điều này bắt buộc để tránh lỗi:
-
-```text
-NameError: dynamic_preprocess is not defined
-```
-
-### 14.4. Accept line Vintern
-
-So sánh VietOCR và Vintern bằng:
-
-```python
-agreement_similarity = difflib.SequenceMatcher(...).ratio()
-```
-
-Nếu similarity cao:
-
-```text
-agree → chọn text có composite_score tốt hơn, need_review=False
-```
-
-Nếu disagreement:
-
-```text
-Vintern chỉ override nếu:
-vintern_score >= vintern_min_composite_accept
-và vintern_score >= old_score + margin
-
-Nếu override do disagreement:
-need_review=True
-```
-
-Nếu Vintern không đủ tốt:
-
-```text
-giữ VietOCR, keep_for_index=False, need_review=True
-```
-
----
-
-## 15. Vintern group fallback
-
-### 15.1. Khi nào gọi group Vintern?
-
-Group được gửi Vintern nếu:
-
-```python
-use_vintern_group_fallback == True
-group_crop_path tồn tại
-num_lines >= vintern_group_min_lines
-và group có ít nhất 1 line need_review hoặc send_to_vintern
-```
-
-### 15.2. Group priority
-
-```python
-group_vlm_priority = mean(line.priority) + bonus
-```
-
-Bonus:
-
-```text
-+0.25 nếu group nhiều dòng
-+0.20 nếu có line VLM candidate
-+0.15 nếu có need_review
-```
-
-Chọn top:
-
-```python
-vintern_group_max_candidates = 4
-```
-
-### 15.3. Group OCR prompt
+Group prompt:
 
 ```text
 Hãy đọc chính xác toàn bộ chữ trong ảnh crop này theo đúng từng dòng.
@@ -945,515 +587,570 @@ Nếu ảnh có nhiều dòng chữ, hãy xuống dòng giữa các dòng.
 Chỉ trả về nội dung OCR, không giải thích.
 ```
 
-### 15.4. Accept group Vintern
+Preprocess Vintern:
 
-Accept nếu:
-
-```python
-group_vintern_composite_score >= 0.55
+```text
+PIL image
+-> dynamic_preprocess
+-> resize/split thành tile 448x448
+-> normalize ImageNet mean/std
+-> tensor [num_tiles, 3, 448, 448]
+-> model.chat(tokenizer, pixel_values, "<image>\n<prompt>", generation_config)
 ```
 
-Hoặc rule mềm:
+Attention implementation:
 
-```python
-len(group_vintern_text) >= max(6, len(group_text_review) * 0.6)
-lex_ratio >= 0.45
-charset_penalty <= 0.05
+```text
+env/config explicit
+-> flash_attention_2 nếu import được
+-> sdpa nếu PyTorch hỗ trợ
+-> eager cuối cùng
 ```
 
-Nếu accept:
+Line candidates:
+
+```text
+line.send_to_vintern == True
+sort theo priority giảm dần
+take top vintern_max_candidates, mặc định 8
+```
+
+Group candidates:
+
+```text
+group có num_lines >= vintern_group_min_lines
+và có ít nhất một line need_review hoặc send_to_vintern
+sort theo group_vlm_priority
+take top vintern_group_max_candidates, mặc định 4
+```
+
+### 4.11. Quyết định accept Vintern
+
+Line Vintern:
+
+- Tính composite score cho text Vintern.
+- Tính similarity giữa VietOCR text và Vintern text.
+- Nếu agreement cao, chọn text có score tốt hơn và `need_review=False`.
+- Nếu disagreement nhưng Vintern tốt hơn đủ margin, override và `need_review=True`.
+- Nếu Vintern yếu/noise, giữ VietOCR nhưng không index, đưa review.
+
+Ngưỡng chính:
 
 ```python
+vintern_min_composite_accept = 0.55
+vintern_override_margin = 0.05
+vintern_agreement_threshold = 0.82
+```
+
+Group Vintern:
+
+- Chạy trên group crop.
+- Tính composite score và similarity với review text cũ.
+- Accept nếu composite đủ cao hoặc pass soft rule độ dài/lex/charset.
+
+Ngưỡng chính:
+
+```python
+group_vintern_min_composite_accept = 0.55
+group_vintern_accept_lex_ratio = 0.45
+group_vintern_accept_max_charset = 0.05
+group_vintern_agreement_threshold = 0.82
+```
+
+Nếu group Vintern được accept:
+
+```text
 group_text_clean = group_vintern_text
 group_text = group_vintern_text
 group_final_source = "vintern_group_fallback"
 group_keep_for_index = True
-need_review = similarity_with_old_review < 0.82
-```
-
-Nghĩa là:
-
-```text
-Vintern group có thể được index,
-nhưng nếu khác nhiều với VietOCR line-level thì vẫn need_review=True.
 ```
 
 ---
 
-## 16. Text outputs
+## 5. Text aggregation rule
 
-### 16.1. Clean output
-
-Chỉ dùng để index/search:
-
-```python
-final_clean_text = "\n\n".join(clean_group_texts)
-final_search_text = final_clean_text
-```
-
-Nguồn của clean text:
+Module:
 
 ```text
-line auto_accept
-line Vintern accepted
-group Vintern accepted
+ocr_pipeline/outputs.py
 ```
 
-### 16.2. Review output
-
-Không dùng để index chính:
-
-```python
-final_review_text = "\n\n".join(review_group_texts)
-```
-
-Nguồn:
+Rule bắt buộc:
 
 ```text
-text nghi ngờ
-text disagreement
-text chưa đủ score
-VietOCR/Vintern candidates chưa được accept
+group_text = group_text_clean
 ```
-
-### 16.3. Rule quan trọng
 
 Không được làm:
 
-```python
+```text
 group_text = clean_text if clean_text else review_text
 ```
 
-Phải làm:
+Lý do: review text chưa được accept không được lọt vào index chính.
 
-```python
-group_text = group_text_clean
-group_text_review = review_text
+Mỗi group có:
+
+```text
+group_text_clean
+group_text_review
+group_text
+group_text_lines
+group_review_lines
+num_keep_lines
+num_filtered_lines
+num_vlm_candidates
+num_vintern_lines
+```
+
+Final frame text:
+
+```text
+final_clean_text = join(group_text_clean)
+final_review_text = join(group_text_review)
 ```
 
 ---
 
-## 17. Export format
+## 6. Output của single-frame mode
 
-Output folder:
-
-```text
-/content/ppocr_group_vietocr_vintern_wordlist_gating_v2_output
-```
-
-Files:
+Khi chạy `run_single_frame.py`, mặc định ghi đầy đủ artifact:
 
 ```text
 <frame>_ocr_lines_wordlist_gating_v2.csv
 <frame>_ocr_groups_wordlist_gating_v2.csv
-<frame>_ocr_es_doc_wordlist_gating_v2.json
 <frame>_ocr_clean_text_wordlist_gating_v2.txt
 <frame>_ocr_review_text_wordlist_gating_v2.txt
+<frame>_ocr_es_doc_wordlist_gating_v2.json
 <frame>_ocr_vis_wordlist_gating_v2.png
+ppocr_line_perspective_crops/
+ppocr_stacked_group_crops/
 ```
 
-### 17.1. CSV line-level
+Mục đích:
 
-Nên có các cột:
+- CSV line-level để xem từng box.
+- CSV group-level để xem group text.
+- TXT clean/review để xem text cuối.
+- JSON ES document để kiểm tra schema.
+- PNG visualization để xem detect/group/filter trên ảnh.
+- Crops để kiểm tra input thật của VietOCR/Vintern.
+
+---
+
+## 7. Output của batch video mode
+
+Khi chạy `run_frame_folder.py --batch_artifacts minimal`, output chính:
 
 ```text
-line_id
-group_id
-vietocr_text
-rec_conf
-rec_conf_source
-rec_conf_flat_run
-det_score
-composite_score
-quality_score
-lex_ratio
-diacritic_susp
-diacritic_suspicious_tokens
-oov_tokens
-charset_penalty
-repetition_penalty
-weak_detection
-priority
-filter_status
-send_to_vintern
-vintern_text
-vintern_composite_score
-agreement_similarity
-final_text
-final_source
-keep_for_index
-need_review
-persp_crop_path
-group_crop_path
-bbox_xyxy
+outputs_video/<video_id>/
+├── <video_id>_ocr_es_docs.jsonl
+├── <video_id>_ocr_frame_summary.csv
+├── <video_id>_ocr_timing_summary.json
+└── frames/
 ```
 
-### 17.2. CSV group-level
+Với `--cleanup_crops`, crop folders trong từng frame sẽ bị xóa sau khi JSONL đã được ghi.
 
-Nên có các cột:
+Không nên bật `--batch_artifacts full` cho dữ liệu lớn, vì sẽ tạo quá nhiều:
 
 ```text
-reading_order
-group_id
-num_lines
-group_text
-group_text_clean
-group_text_review
-group_vintern_text
-group_vintern_composite_score
-group_vintern_agreement_similarity
-group_final_source
-group_keep_for_index
-need_review
-group_crop_path
-bbox_xyxy
-mean_det_score
-mean_composite_score
-num_keep_lines
-num_vlm_candidates
-```
-
-### 17.3. ES document
-
-Schema chính:
-
-```json
-{
-  "frame_id": "...",
-  "image_path": "...",
-  "ocr_pipeline": {
-    "detector": "PP-OCRv6_medium_det",
-    "line_recognizer": "VietOCR/vgg_transformer",
-    "fallback_vlm_line": "5CD-AI/Vintern-1B-v3_5",
-    "fallback_vlm_group": "5CD-AI/Vintern-1B-v3_5",
-    "wordlist_enabled": true,
-    "wordlist_size": 123456,
-    "group_text_rule": "group_text_clean only; group_text_review is not indexed"
-  },
-  "timing": {
-    "det_time_sec": 0.0,
-    "vietocr_total_time_sec": 0.0,
-    "vintern_line_total_time_sec": 0.0,
-    "vintern_group_total_time_sec": 0.0
-  },
-  "ocr_text_clean": "...",
-  "ocr_text_review": "...",
-  "ocr_group_texts_clean": [],
-  "ocr_group_texts_review": [],
-  "ocr_lines": [],
-  "ocr_groups": []
-}
+CSV
+TXT
+PNG
+JSON từng frame
+line crops
+group crops
 ```
 
 ---
 
-## 18. Agent implementation checklist
+## 8. ES-friendly schema
 
-### 18.1. Environment
+Mỗi dòng trong JSONL là một document cho một frame.
 
-Agent cần đảm bảo:
+Các field chính:
+
+```text
+schema_version
+document_id
+video_id
+frame_id
+frame_number
+image_path
+media
+ocr_pipeline
+timing
+quality
+ocr_text_clean
+ocr_text_review
+ocr_text_search
+ocr_text_unaccent
+ocr_terms
+ocr_group_texts_clean
+ocr_group_texts_review
+ocr_lines
+ocr_groups
+```
+
+Search field:
+
+| Field | Vai trò |
+|---|---|
+| `ocr_text_search` | Text clean đã normalize space, dùng search chính. |
+| `ocr_text_unaccent` | Bản không dấu, casefold, hỗ trợ fuzzy/lazy search tiếng Việt. |
+| `ocr_terms` | Token unique để autocomplete/filter đơn giản. |
+| `ocr_text_review` | Text nghi ngờ, không search chính trừ khi bật option. |
+
+Mặc định:
+
+```python
+es_include_review_in_search = False
+```
+
+Tức là review text không vào `ocr_text_search`.
+
+Quality field có:
+
+```text
+lines_detected
+groups_formed
+clean_chars
+review_chars
+num_keep_lines
+num_review_lines
+num_noise_filtered_lines
+num_vintern_lines
+num_vlm_candidates
+gating_stats
+final_source_stats
+```
+
+---
+
+## 9. Search local trước khi đưa vào ES
+
+File:
+
+```text
+search_ocr_results.py
+```
+
+Dùng để kiểm tra JSONL output mà chưa cần Elasticsearch.
+
+Ví dụ:
 
 ```bash
-pip install paddleocr paddlepaddle
-pip install vietocr
-pip install transformers==4.45.2 accelerate==0.34.2 tokenizers==0.20.3
-pip install timm einops torchvision pillow opencv-python-headless pandas matplotlib tqdm
+python search_ocr_results.py \
+  --jsonl outputs_video/L22_V012_full_w4 \
+  --query "khoa nhiễm thần kinh" \
+  --top_k 10 \
+  --show_lines
 ```
 
-Nếu dùng Colab GPU:
+Search có hỗ trợ:
 
-```python
-torch.cuda.is_available() == True
-```
+- đọc một file JSONL
+- đọc folder output chứa `*_ocr_es_docs.jsonl`
+- normalize tiếng Việt không dấu
+- fuzzy token matching bằng `difflib.SequenceMatcher`
+- search review text nếu thêm `--include_review`
+- lọc frame range bằng `--frame_from`, `--frame_to`
+- xuất JSON bằng `--json`
 
-Paddle có thể chạy CPU nếu GPU Paddle lỗi:
+Ví dụ search cả review text:
 
-```python
-PADDLE_DEVICE = "gpu:0" if paddle.is_compiled_with_cuda() else "cpu"
-```
-
-### 18.2. Wordlist
-
-Agent nên kiểm tra wordlist trước khi chạy:
-
-```python
-assert Path("/content/drive/MyDrive/vietnamese/general_dict.txt").exists()
-assert Path("/content/drive/MyDrive/vietnamese/vn_dictionary.txt").exists()
-```
-
-Nếu không có:
-
-```text
-WORDLIST_ENABLED=False
-lex_ratio=0.50 neutral
-```
-
-Điều này vẫn chạy được nhưng gating kém chính xác hơn.
-
-### 18.3. Vintern
-
-Agent phải đảm bảo sau khi load Vintern:
-
-```python
-dynamic_preprocess is defined
-vintern_model is not None
-vintern_tokenizer is not None
-```
-
-Nếu Vintern inference time chỉ `0.003s/crop`, gần như chắc chắn Vintern không chạy thật mà đang lỗi nhanh.
-
-### 18.4. Debug quan trọng
-
-Sau Cell 12 cần kiểm tra:
-
-```text
-rec_conf_source distribution
-rec_conf stats
-rec_conf_flat
-num_auto_accept
-num_escalate_candidates
-escalation_rate_non_structural
-```
-
-Nếu:
-
-```text
-rec_conf_source = return_prob_missing toàn bộ
-```
-
-thì pipeline đang dùng rec-missing rule.
-
-### 18.5. Chỉ số cần log khi scale nhiều frame
-
-Per frame:
-
-```text
-num_lines
-num_structural_filtered
-num_auto_accept
-num_line_vlm_candidates
-num_line_vintern_called
-num_group_vintern_called
-num_keep_lines
-num_review_groups
-det_time
-vietocr_time
-vintern_line_time
-vintern_group_time
-```
-
-Aggregate:
-
-```text
-auto_accept_rate
-line_escalation_rate
-group_escalation_rate
-review_rate
-avg_vietocr_time_per_crop
-avg_vintern_time_per_line
-avg_vintern_time_per_group
+```bash
+python search_ocr_results.py \
+  --jsonl outputs_video/L22_V012_full_w4 \
+  --query "my phuoc tan van" \
+  --include_review \
+  --show_lines
 ```
 
 ---
 
-## 19. Pseudocode end-to-end
+## 10. Performance và scale
 
-```python
-def run_ocr_pipeline(image_path):
-    img_rgb = load_image(image_path)
+### 10.1. Progress hiện tại
 
-    boxes, det_scores = ppocr_detect(img_rgb)
+Batch runner hiển thị progress frame-level:
 
-    line_items = []
-    for box, det_score in zip(boxes, det_scores):
-        if not valid_box(box, det_score):
-            continue
+```text
+OCR L22_V012_full_w4: 100%| 283/283 [05:29<00:00, 1.16s/frame, avg=1.16s ETA=0s last=227]
+```
 
-        line_crop = crop_line_perspective(img_rgb, box)
-        line_item = make_line_item(box, det_score, line_crop)
-        line_items.append(line_item)
+Thông tin cần theo dõi:
 
-    groups = group_line_items(line_items)
+```text
+processed / total
+elapsed
+ETA
+sec/frame
+avg sec/frame
+last frame id
+```
 
-    for group in groups:
-        group_crop = crop_group_context(img_rgb, group)
-        group["group_crop_path"] = save(group_crop)
+Nếu không dùng tqdm, logger vẫn in progress message có:
 
-    for line in line_items:
-        text, rec_conf, source = vietocr_recognize(line["persp_crop_path"])
-        line["vietocr_text"] = text
-        line["rec_conf"] = rec_conf
-        line["rec_conf_source"] = source
-        score_and_gate_line(line)
+```text
+det time
+vietocr time
+vintern time
+clean chars
+review chars
+projected total
+```
 
-    if rec_conf_is_flat_or_missing(line_items):
-        for line in line_items:
-            line["rec_conf_flat_run"] = True
-            score_and_gate_line(line)
+### 10.2. Multi-worker
 
-    line_candidates = rank_line_vlm_candidates(line_items)
+`run_frame_folder.py` hỗ trợ:
 
-    for line in line_candidates:
-        vtext = vintern_ocr_line(line["persp_crop_path"])
-        decide_line_final_text(line, vtext)
+```bash
+--workers N
+```
 
-    build_group_text_clean_review(groups, line_items)
+Với `workers > 1`, code dùng `ProcessPoolExecutor` với multiprocessing `spawn`.
 
-    group_candidates = rank_group_vlm_candidates(groups, line_items)
+Mỗi worker tự load:
 
-    for group in group_candidates:
-        gv_text = vintern_ocr_group(group["group_crop_path"])
-        decide_group_final_text(group, gv_text)
+```text
+wordlist
+detector
+VietOCR predictor
+Vintern model nếu bật
+```
 
-    final_clean_text = collect_group_clean_text(groups)
-    final_review_text = collect_group_review_text(groups)
+Điều này tăng throughput nhưng cũng nhân VRAM/model memory theo số worker.
 
-    export_outputs(line_items, groups, final_clean_text, final_review_text)
+Kinh nghiệm hiện tại trên A5000 24GB:
+
+```text
+workers=4
+GPU util có thể đạt 100%
+VRAM khoảng 8-12GB tùy workload
+```
+
+Không phải càng nhiều worker càng nhanh. Nếu `GPU-Util` đã 95-100%, pipeline đang compute-bound. Tăng worker thêm có thể làm chậm vì tranh GPU và tăng overhead.
+
+### 10.3. Ước tính 1M frame
+
+Từ log thực tế:
+
+```text
+283 frames / 05:29 ≈ 1.16 sec/frame
+```
+
+Ước tính:
+
+```text
+1,000,000 frames × 1.16 sec ≈ 1,160,000 sec
+≈ 322 giờ
+≈ 13.4 ngày / 1 GPU
+```
+
+Nên dùng biên an toàn:
+
+```text
+1 GPU  -> 14-17 ngày
+2 GPU  -> 7-8.5 ngày
+4 GPU  -> 3.5-4.2 ngày
+8 GPU  -> 1.8-2.1 ngày
+```
+
+Nếu video có nhiều text hơn hoặc nhiều Vintern fallback hơn, thời gian sẽ tăng.
+
+### 10.4. Storage strategy cho dữ liệu lớn
+
+Với dữ liệu lớn, luôn chạy:
+
+```bash
+--batch_artifacts minimal --cleanup_crops --quiet
+```
+
+Chỉ giữ:
+
+```text
+ES JSONL
+frame summary CSV
+timing summary JSON
+command/config log nếu cần
+```
+
+Không giữ crop/visualization đại trà cho 1M frame.
+
+Chỉ tạo artifact debug cho:
+
+```text
+sample nhỏ
+frame lỗi
+frame có review_chars cao
+frame có low confidence
+frame cần audit thủ công
 ```
 
 ---
 
-## 20. Các lỗi thường gặp và cách xử lý
+## 11. Checklist chạy thật
 
-### 20.1. `NameError: dynamic_preprocess is not defined`
+### 11.1. Trước khi chạy
 
-Nguyên nhân: chưa chạy cell định nghĩa Vintern preprocess.
+Kiểm tra GPU/disk:
 
-Fix:
-
-```text
-Chạy lại CELL 6.1 trước CELL 12/13.1.
+```bash
+nvidia-smi
+df -h /tmp2
+du -sh outputs_video 2>/dev/null
 ```
 
-### 20.2. `rec_conf_source = return_prob_missing`
+Kiểm tra env:
 
-Nguyên nhân: VietOCR version/config không trả confidence.
-
-Hướng xử lý:
-
-```text
-Pipeline vẫn chạy bằng rec-missing rule.
-Có thể thử vietocr_beamsearch=False để xem return_prob có hoạt động không.
+```bash
+which python
+python -V
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+python -c "import paddle; print('paddle', paddle.__version__, paddle.is_compiled_with_cuda())"
+python -c "import paddleocr; print('paddleocr ok')"
 ```
 
-### 20.3. Escalation rate = 1.0
+### 11.2. Smoke test
 
-Nếu confidence missing toàn bộ, các dòng ngắn/tên riêng sẽ bị escalate là đúng. Nhưng ticker dài nên có thể auto-accept nếu wordlist tốt.
+Chạy 20 frame:
 
-Tuning:
-
-```python
-CONFIG["rec_missing_auto_accept_min_tokens"] = 4
-CONFIG["rec_missing_auto_accept_lex_ratio"] = 0.60
+```bash
+CUDA_VISIBLE_DEVICES=0 OCR_V2_PADDLE_DEVICE=gpu:0 OCR_V2_PADDLE_ENGINE=paddle_dynamic OCR_V2_VINTERN_ATTN=flash_attention_2 \
+python run_frame_folder.py \
+  --frames_dir ../../../keyframe_test/L22_V012 \
+  --output_dir ./outputs_video \
+  --video_id L22_V012_smoke_w2 \
+  --limit 20 \
+  --workers 2 \
+  --no_vietocr_batch \
+  --batch_artifacts minimal \
+  --cleanup_crops \
+  --quiet
 ```
 
-### 20.4. Group Vintern không accept dù đọc đúng
+Chạy 40 frame với worker cao hơn:
 
-Tuning:
-
-```python
-CONFIG["group_vintern_min_composite_accept"] = 0.50
+```bash
+CUDA_VISIBLE_DEVICES=0 OCR_V2_PADDLE_DEVICE=gpu:0 OCR_V2_PADDLE_ENGINE=paddle_dynamic OCR_V2_VINTERN_ATTN=flash_attention_2 \
+python run_frame_folder.py \
+  --frames_dir ../../../keyframe_test/L22_V012 \
+  --output_dir ./outputs_video \
+  --video_id L22_V012_smoke_w4 \
+  --limit 40 \
+  --workers 4 \
+  --no_vietocr_batch \
+  --batch_artifacts minimal \
+  --cleanup_crops \
+  --quiet
 ```
 
-hoặc sửa `group_vintern_should_accept`.
+Sau đó search thử:
 
-### 20.5. Text review lọt vào index
-
-Không được fallback:
-
-```python
-group_text = clean_text if clean_text else review_text
+```bash
+python search_ocr_results.py \
+  --jsonl outputs_video/L22_V012_smoke_w4 \
+  --query "khoa nhiễm thần kinh" \
+  --show_lines
 ```
 
-Phải giữ:
+### 11.3. Chạy full video
 
-```python
-group_text = group_text_clean
+```bash
+CUDA_VISIBLE_DEVICES=0 OCR_V2_PADDLE_DEVICE=gpu:0 OCR_V2_PADDLE_ENGINE=paddle_dynamic OCR_V2_VINTERN_ATTN=flash_attention_2 \
+python run_frame_folder.py \
+  --frames_dir ../../../keyframe_test/L22_V012 \
+  --output_dir ./outputs_video \
+  --video_id L22_V012_full_w4 \
+  --pattern "*.jpg" \
+  --workers 4 \
+  --no_vietocr_batch \
+  --batch_artifacts minimal \
+  --cleanup_crops \
+  --quiet
 ```
 
 ---
 
-## 21. Roadmap sau khi agent implement xong
+## 12. Những điểm cần tránh
 
-### P0 — chạy ổn single frame
+Không chạy full dataset với:
 
-- Detector chạy được.
-- Line crop/group crop lưu đúng.
-- VietOCR chạy được.
-- Wordlist load được.
-- Gating tạo `clean_text` và `review_text` riêng.
-- Vintern line/group chạy thật.
-
-### P1 — benchmark vài nghìn frame
-
-Log:
-
-```text
-escalation_rate
-review_rate
-false_accept samples
-false_reject samples
-runtime per stage
+```bash
+--batch_artifacts full
 ```
 
-### P2 — tối ưu rule tay
+trừ khi chỉ test rất ít frame.
 
-Dựa trên log thật:
+Không bật VietOCR batch decoder cho run chính nếu chưa kiểm tra kỹ:
 
-```text
-chỉnh threshold rec_missing
-chỉnh group_vintern acceptance
-chỉnh structural filter
+```bash
+--vietocr_batch
 ```
 
-### P3 — train composite score
+vì batch path hiện là experimental và có fallback nhưng vẫn cần audit.
 
-Chỉ làm sau khi có khoảng 200–300 dòng gán nhãn thật từ nhiều video:
+Không index review text vào search chính nếu chưa có lý do rõ ràng:
 
-```text
-label: correct / incorrect / review / structural
-features: rec_conf, det_score, lex_ratio, diacritic_susp, charset_penalty, text_len, token_count
-model: logistic regression hoặc small tree
+```python
+es_include_review_in_search = False
 ```
 
-Không nên train trước khi có log thật, vì dễ overfit một clip.
+Không tăng `--workers` chỉ vì VRAM còn trống. Nếu GPU util đã 100%, worker cao hơn thường không giúp.
+
+Không đánh giá pipeline chỉ bằng `clean_text`; cần xem thêm:
+
+```text
+review_chars
+gating_stats
+num_vlm_candidates
+num_noise_filtered_lines
+visualization trên sample
+search local trên JSONL
+```
 
 ---
 
-## 22. Kết luận triển khai
+## 13. Roadmap gần nhất
 
-Workflow hiện tại nên được hiểu là **OCR confidence funnel**, không chỉ là OCR model chaining.
+Các cải tiến nên ưu tiên tiếp theo:
 
-Vai trò từng thành phần:
+1. Thêm `--shard_index` và `--num_shards` cho `run_frame_folder.py` để chia việc sạch trên nhiều GPU/server.
+2. Thêm option xóa empty `frames/<frame_id>/` sau khi `--cleanup_crops`.
+3. Thêm mode chỉ lưu crop/visualization cho frame có `review_chars > 0` hoặc `num_vlm_candidates > 0`.
+4. Benchmark chính thức `workers=1/2/3/4` trên cùng một video để chọn cấu hình ổn định.
+5. Chuẩn hóa mapping Elasticsearch thật dựa trên các field `ocr_text_search`, `ocr_text_unaccent`, `ocr_terms`, `quality`, `timing`.
+
+---
+
+## 14. Tóm tắt cuối
+
+Workflow hiện tại:
 
 ```text
-PP-OCRv6 DET:
-  phát hiện line boxes
-
-VietOCR:
-  recognizer chính, nhanh hơn VLM
-
-Wordlist + composite score:
-  giảm escalation rate giả
-  phát hiện nghi lỗi dấu
-  quyết định auto_accept hay VLM
-
-Vintern line fallback:
-  xử lý line crop khó
-
-Vintern group fallback:
-  xử lý group nhiều dòng/cần context
-
-group_text_clean:
-  output an toàn để index
-
-group_text_review:
-  output debug/manual review, không index chính
+PP-OCRv6 detect
+-> filter box bằng width/height aspect
+-> perspective line crop
+-> group line boxes
+-> VietOCR đọc line crop
+-> wordlist + composite score
+-> structural/noise filter
+-> Vintern đọc line/group crop nếu cần
+-> clean/review aggregation
+-> ES-friendly JSONL
+-> local fuzzy search hoặc Elasticsearch
 ```
 
-Nguyên tắc quan trọng nhất:
+Triết lý chính:
 
 ```text
-Không index text nếu chưa được accept.
-Nếu không chắc → review hoặc Vintern group.
+VietOCR là recognizer nhanh.
+Vintern là fallback đắt tiền cho crop nghi ngờ.
+Wordlist/gating giảm số crop gửi VLM.
+Clean text mới được index.
+Review text phục vụ debug/audit.
+Batch mode phải tối ưu I/O và storage trước khi scale lên 1M frame.
 ```
