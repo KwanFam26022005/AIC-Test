@@ -55,4 +55,14 @@ quality_gate:
   max_repetition_ratio: 0.35
   min_duration_sec: 0.5
   include_empty_features: false
+  boilerplate_patterns:
+    - "subscribe"
+    - "đăng ký"
+    - "không bỏ lỡ"
+    - "cảm ơn quý vị đã theo dõi"
+    - "amara.org"
+    - "phụ đề được tạo ra bởi"
+    - "bản quyền thuộc về"
+  duplicate_transcript_min_count: 3
+  duplicate_transcript_min_gap_sec: 60
 

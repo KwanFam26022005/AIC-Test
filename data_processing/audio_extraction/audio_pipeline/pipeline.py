@@ -10,6 +10,7 @@ from .io_utils import read_jsonl, round_sec, safe_stem, utc_now_iso, write_jsonl
 from .media import extract_audio, probe_video
 from .paths import AudioOutputPaths
 from .vad import build_asr_jobs
+from .validation import build_audio_quality_summary, write_quality_summary
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,15 @@ def run_pipeline(
         feature_rows = build_audio_features(asr_rows, cfg)
         write_jsonl(paths.asr_quality_report, quality_rows)
         write_jsonl(paths.audio_features, feature_rows)
+
+        # Phase 6: build and write validation summary per video
+        video_ids = sorted({row.get("video_id", "") for row in asr_rows if row.get("video_id")})
+        for vid in video_ids:
+            vid_asr = [r for r in asr_rows if r.get("video_id") == vid]
+            vid_quality = [r for r in quality_rows if r.get("video_id") == vid]
+            vid_features = [r for r in feature_rows if r.get("video_id") == vid]
+            summary_data = build_audio_quality_summary(vid_asr, vid_quality, vid_features, vid)
+            write_quality_summary(summary_data, paths.audio_quality_summary)
     else:
         asr_rows = read_jsonl(paths.asr_segments)
         quality_rows = []
@@ -87,7 +97,30 @@ def create_video_manifest(videos: list[Path], video_id_override: str | None = No
         seen.add(video_id)
 
         logger.info("Probing video: %s", video_path)
-        info = probe_video(video_path)
+        try:
+            info = probe_video(video_path)
+        except Exception as exc:
+            logger.exception("Probe failed for video_id=%s", video_id)
+            rows.append(
+                {
+                    "schema_version": "video_manifest_v1",
+                    "video_id": video_id,
+                    "video_path": str(video_path),
+                    "duration_sec": None,
+                    "fps": None,
+                    "width": None,
+                    "height": None,
+                    "has_audio": False,
+                    "audio_codec": None,
+                    "audio_sample_rate": None,
+                    "audio_channels": None,
+                    "status": "probe_failed",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "created_at": utc_now_iso(),
+                }
+            )
+            continue
         rows.append(
             {
                 "schema_version": "video_manifest_v1",
@@ -101,7 +134,7 @@ def create_video_manifest(videos: list[Path], video_id_override: str | None = No
                 "audio_codec": info.get("audio_codec"),
                 "audio_sample_rate": info.get("audio_sample_rate"),
                 "audio_channels": info.get("audio_channels"),
-                "status": "pending" if info.get("has_audio") else "no_audio",
+                "status": "probed" if info.get("has_audio") else "no_audio",
                 "created_at": utc_now_iso(),
             }
         )

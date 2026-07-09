@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 from pathlib import Path
@@ -11,8 +12,33 @@ from .media import probe_wav, read_wav_mono_pcm16
 logger = logging.getLogger(__name__)
 
 
+def compute_job_fingerprint(job_data: dict, asr_cfg: dict[str, Any]) -> str:
+    """Create a stable SHA-1 fingerprint from job params + ASR config.
+
+    If any of these values change, the fingerprint changes and the pipeline
+    will re-run the job instead of using stale cached results.
+    """
+    parts = [
+        str(job_data.get("video_id", "")),
+        str(job_data.get("audio_path", "")),
+        str(job_data.get("start_sec", "")),
+        str(job_data.get("end_sec", "")),
+        str(job_data.get("duration_sec", "")),
+        str(job_data.get("segment_type", "")),
+        str(asr_cfg.get("model_path") or asr_cfg.get("model") or ""),
+        str(asr_cfg.get("language") or ""),
+        str(asr_cfg.get("beam_size") or ""),
+        str(asr_cfg.get("temperature") or ""),
+        str(asr_cfg.get("condition_on_previous_text") or ""),
+        str(asr_cfg.get("vad_filter") or ""),
+    ]
+    raw = "|".join(parts)
+    return "sha1:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
 def build_asr_jobs(audio_rows: list[dict], cfg: dict[str, Any]) -> list[dict]:
     vad_cfg = cfg.get("vad", {})
+    asr_cfg = cfg.get("asr", {})
     jobs: list[dict] = []
     for audio_row in audio_rows:
         if not audio_row.get("has_audio") or audio_row.get("extract_status") in {"failed", "no_audio"}:
@@ -23,19 +49,19 @@ def build_asr_jobs(audio_rows: list[dict], cfg: dict[str, Any]) -> list[dict]:
         for idx, segment in enumerate(segments, start=1):
             start_sec = round_sec(segment["start_sec"])
             end_sec = round_sec(segment["end_sec"])
-            jobs.append(
-                {
-                    "job_id": f"asrjob_{video_id}_{idx:06d}",
-                    "video_id": video_id,
-                    "audio_path": str(audio_path),
-                    "start_sec": start_sec,
-                    "end_sec": end_sec,
-                    "duration_sec": round_sec(end_sec - start_sec),
-                    "segment_type": segment.get("segment_type", "speech"),
-                    "priority": 1,
-                    "status": "pending",
-                }
-            )
+            job_data = {
+                "job_id": f"asrjob_{video_id}_{idx:06d}",
+                "video_id": video_id,
+                "audio_path": str(audio_path),
+                "start_sec": start_sec,
+                "end_sec": end_sec,
+                "duration_sec": round_sec(end_sec - start_sec),
+                "segment_type": segment.get("segment_type", "speech"),
+                "priority": 1,
+                "status": "planned",
+            }
+            job_data["job_fingerprint"] = compute_job_fingerprint(job_data, asr_cfg)
+            jobs.append(job_data)
     return jobs
 
 

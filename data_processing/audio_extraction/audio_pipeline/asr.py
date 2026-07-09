@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from .io_utils import append_jsonl, append_jsonl_many, read_jsonl, round_sec, utc_now_iso
+from .io_utils import append_jsonl, append_jsonl_many, read_jsonl, round_sec, utc_now_iso, write_jsonl
 from .media import write_wav_chunk
 from .paths import AudioOutputPaths
 
@@ -28,16 +28,23 @@ def run_asr_jobs(
         raise ValueError("Only backend='faster-whisper' is implemented in this pipeline.")
 
     existing_rows = [] if force else read_jsonl(paths.asr_segments)
-    done_job_ids = {
-        row.get("job_id")
-        for row in existing_rows
-        if row.get("status") in {"success", "empty"} and row.get("job_id")
-    }
-    pending_jobs = [job for job in jobs if force or job["job_id"] not in done_job_ids]
+    # Phase 4: resume by (job_id, job_fingerprint) to avoid using stale results
+    done_keys: set[tuple[str, str]] = set()
+    for row in existing_rows:
+        if row.get("status") in {"success", "empty"} and row.get("job_id"):
+            done_keys.add((row.get("job_id", ""), row.get("job_fingerprint", "")))
+
+    pending_jobs = []
+    for job in jobs:
+        key = (job["job_id"], job.get("job_fingerprint", ""))
+        if not force and key in done_keys:
+            continue
+        pending_jobs.append(job)
+
     if asr_cfg.get("sort_jobs_by_duration", True):
         pending_jobs.sort(key=lambda job: float(job.get("duration_sec") or 0.0))
 
-    logger.info("ASR jobs: total=%d done=%d pending=%d", len(jobs), len(done_job_ids), len(pending_jobs))
+    logger.info("ASR jobs: total=%d done=%d pending=%d", len(jobs), len(done_keys), len(pending_jobs))
     if not pending_jobs:
         return existing_rows
 
@@ -62,6 +69,7 @@ def run_asr_jobs(
                 logger.exception("ASR failed for job=%s", job.get("job_id"))
                 failed = {
                     "job_id": job.get("job_id"),
+                    "job_fingerprint": job.get("job_fingerprint"),
                     "video_id": job.get("video_id"),
                     "audio_path": job.get("audio_path"),
                     "start_sec": job.get("start_sec"),
@@ -76,7 +84,16 @@ def run_asr_jobs(
                     failed["debug_chunk_path"] = _save_failed_chunk(job, paths)
                 append_jsonl(paths.asr_failed, failed)
 
-    return read_jsonl(paths.asr_segments)
+    # Phase 2: sort ASR segments by timeline before returning
+    all_rows = read_jsonl(paths.asr_segments)
+    all_rows.sort(key=lambda r: (
+        str(r.get("video_id", "")),
+        float(r.get("start_sec") or 0.0),
+        float(r.get("end_sec") or 0.0),
+        str(r.get("asr_segment_id", "")),
+    ))
+    write_jsonl(paths.asr_segments, all_rows)
+    return all_rows
 
 
 def _load_faster_whisper_model(asr_cfg: dict[str, Any]):
@@ -191,6 +208,7 @@ def _asr_row(
         "schema_version": "asr_segment_v1",
         "asr_segment_id": segment_id,
         "job_id": job["job_id"],
+        "job_fingerprint": job.get("job_fingerprint"),
         "video_id": job["video_id"],
         "start_sec": round_sec(start_sec),
         "end_sec": round_sec(end_sec),

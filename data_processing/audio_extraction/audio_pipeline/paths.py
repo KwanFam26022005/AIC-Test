@@ -20,6 +20,7 @@ class AudioOutputPaths:
     asr_failed: Path
     asr_quality_report: Path
     audio_features: Path
+    audio_quality_summary: Path
 
     @classmethod
     def from_root(cls, output_root: str | Path) -> "AudioOutputPaths":
@@ -45,6 +46,7 @@ class AudioOutputPaths:
             asr_failed=asr_dir / "asr_failed.jsonl",
             asr_quality_report=asr_dir / "asr_quality_report.jsonl",
             audio_features=features_dir / "audio_features.jsonl",
+            audio_quality_summary=features_dir / "audio_quality_summary.json",
         )
 
     def mkdirs(self) -> None:

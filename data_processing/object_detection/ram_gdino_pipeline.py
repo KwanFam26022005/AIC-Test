@@ -10,6 +10,8 @@ frame to a JSONL file.
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import json
 import logging
 import os
@@ -27,6 +29,7 @@ from tqdm import tqdm
 
 from tag_canonicalization import (
     build_dino_prompt,
+    build_search_fields,
     canonicalize_detections,
     filter_tags_for_dino,
 )
@@ -35,7 +38,7 @@ from tag_canonicalization import (
 LOG = logging.getLogger("object_detection")
 
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".webp"})
-SCHEMA_VERSION = "ram_gdino_object_detection_v1"
+SCHEMA_VERSION = "ram_gdino_object_detection_v1_1"
 
 RAM_CHECKPOINT_FILENAME = "ram_plus_swin_large_14m.pth"
 RAM_CHECKPOINT_URL = (
@@ -51,6 +54,7 @@ DEFAULTS: dict[str, Any] = {
     "pattern": "*.jpg",
     "limit": None,
     "resume": False,
+    "resume_legacy": True,
     "summary_output": None,
     "device": "auto",
     "hf_cache_dir": None,
@@ -69,6 +73,11 @@ DEFAULTS: dict[str, Any] = {
     "flush_every": 1,
     "quiet": False,
     "debug": False,
+    # Metadata — Phase 1
+    "video_manifest": None,
+    "keyframe_map": None,
+    "frames_root": None,
+    "timestamp_strategy": "map_or_uniform",
 }
 
 CONFIG_KEY_MAP = {
@@ -79,6 +88,7 @@ CONFIG_KEY_MAP = {
     "io.pattern": "pattern",
     "io.limit": "limit",
     "io.resume": "resume",
+    "io.resume_legacy": "resume_legacy",
     "io.summary_output": "summary_output",
     "io.flush_every": "flush_every",
     "runtime.device": "device",
@@ -95,6 +105,10 @@ CONFIG_KEY_MAP = {
     "grounding_dino.text_threshold": "text_threshold",
     "postprocess.nms_iou_threshold": "nms_iou_threshold",
     "postprocess.scene_area_threshold": "scene_area_threshold",
+    "metadata.video_manifest": "video_manifest",
+    "metadata.keyframe_map": "keyframe_map",
+    "metadata.frames_root": "frames_root",
+    "metadata.timestamp_strategy": "timestamp_strategy",
 }
 
 
@@ -168,6 +182,7 @@ def build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     resume_group = parser.add_mutually_exclusive_group()
     resume_group.add_argument("--resume", dest="resume", action="store_true", default=defaults["resume"], help="Skip frame_ids already present in output JSONL.")
     resume_group.add_argument("--no-resume", dest="resume", action="store_false", help="Overwrite outputs instead of resuming.")
+    parser.add_argument("--resume-legacy", dest="resume_legacy", action="store_true", default=defaults["resume_legacy"], help="When resuming, skip frames without fingerprint match (legacy behavior).")
 
     parser.add_argument("--pattern", default=defaults["pattern"], help="Glob pattern for frames inside each video directory.")
     parser.add_argument("--limit", type=int, default=defaults["limit"], help="Limit frames per video.")
@@ -196,6 +211,14 @@ def build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--text-threshold", type=float, default=defaults["text_threshold"], help="GroundingDINO text threshold.")
     parser.add_argument("--nms-iou-threshold", type=float, default=defaults["nms_iou_threshold"], help="Class-agnostic NMS IoU threshold.")
     parser.add_argument("--scene-area-threshold", type=float, default=defaults["scene_area_threshold"], help="Move boxes above this area ratio to tags instead of object counts.")
+
+    # Metadata — Phase 1
+    parser.add_argument("--video-manifest", default=defaults["video_manifest"], help="Path to video_manifest.jsonl for timestamp fallback.")
+    parser.add_argument("--keyframe-map", default=defaults["keyframe_map"], help="Path to keyframe map CSV (or directory of CSVs for batch mode).")
+    parser.add_argument("--frames-root", default=defaults["frames_root"], help="Root directory of keyframes for image_relpath resolution.")
+    parser.add_argument("--timestamp-strategy", default=defaults["timestamp_strategy"],
+                        choices=["map_or_uniform", "map_only", "uniform", "none"],
+                        help="How to assign timestamps: map_or_uniform|map_only|uniform|none.")
 
     parser.add_argument("--quiet", action="store_true", default=defaults["quiet"], help="Reduce logs.")
     parser.add_argument("--debug", action="store_true", default=defaults["debug"], help="Raise/print detailed errors.")
@@ -352,16 +375,21 @@ def iter_jsonl(path: str | Path) -> Iterable[dict[str, Any]]:
                 yield doc
 
 
-def load_existing_frame_ids(output_path: str | Path) -> set[str]:
+def load_existing_records(output_path: str | Path) -> dict[str, str | None]:
+    """Load existing frame_id -> frame_fingerprint mapping from output JSONL.
+
+    Returns:
+        dict: frame_id -> frame_fingerprint (or None if legacy record)
+    """
     path = Path(output_path)
     if not path.is_file():
-        return set()
+        return {}
 
-    existing: set[str] = set()
+    existing: dict[str, str | None] = {}
     for doc in iter_jsonl(path):
         frame_id = doc.get("frame_id")
         if frame_id:
-            existing.add(str(frame_id))
+            existing[str(frame_id)] = doc.get("frame_fingerprint")
 
     if existing:
         LOG.info("Resume: found %d existing frames in %s", len(existing), path)
@@ -387,6 +415,215 @@ def unique_preserve_order(values: Iterable[str]) -> list[str]:
         seen.add(key)
         out.append(clean)
     return out
+
+
+# ============================================================================
+# KEYFRAME MAP & TIMESTAMP RESOLVER
+# ============================================================================
+
+def load_keyframe_map_csv(csv_path: str | Path) -> dict[int, dict[str, Any]]:
+    """Load keyframe map CSV vào dict keyed by `n` (keyframe ordinal).
+
+    CSV format expected:
+        n,pts_time,fps,frame_idx
+        1,0.0,30.0,0
+        2,3.0,30.0,90
+
+    Args:
+        csv_path: Path to CSV file
+
+    Returns:
+        dict: {keyframe_idx: {"pts_time": float, "fps": float, "frame_idx": int}}
+    """
+    result: dict[int, dict[str, Any]] = {}
+    path = Path(csv_path)
+    if not path.is_file():
+        LOG.warning("Keyframe map CSV not found: %s", csv_path)
+        return result
+
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                n = int(row["n"])
+                result[n] = {
+                    "pts_time": float(row["pts_time"]),
+                    "fps": float(row.get("fps", 0)),
+                    "frame_idx": int(row.get("frame_idx", 0)),
+                }
+            except (KeyError, ValueError) as exc:
+                LOG.warning("Skipping malformed keyframe map row: %s (%s)", row, exc)
+
+    LOG.info("Loaded keyframe map: %d entries from %s", len(result), csv_path)
+    return result
+
+
+def find_keyframe_map_for_video(keyframe_map_path: str | Path | None, video_id: str) -> dict[int, dict[str, Any]]:
+    """Find and load keyframe map CSV for a given video_id.
+
+    Supports:
+        - Direct CSV file path
+        - Directory containing <video_id>/<video_id>.csv
+        - Directory containing <video_id>.csv
+
+    Args:
+        keyframe_map_path: CLI/config path (file or directory)
+        video_id: video identifier
+
+    Returns:
+        dict: keyframe map or empty dict
+    """
+    if not keyframe_map_path:
+        return {}
+
+    path = Path(keyframe_map_path)
+
+    if path.is_file():
+        return load_keyframe_map_csv(path)
+
+    if path.is_dir():
+        # Try <dir>/<video_id>/<video_id>.csv
+        candidate = path / video_id / f"{video_id}.csv"
+        if candidate.is_file():
+            return load_keyframe_map_csv(candidate)
+        # Try <dir>/<video_id>.csv
+        candidate = path / f"{video_id}.csv"
+        if candidate.is_file():
+            return load_keyframe_map_csv(candidate)
+
+    LOG.debug("No keyframe map found for video_id=%s at %s", video_id, keyframe_map_path)
+    return {}
+
+
+def load_video_manifest(manifest_path: str | Path | None) -> dict[str, dict[str, Any]]:
+    """Load video_manifest.jsonl for fallback metadata.
+
+    Returns:
+        dict: {video_id: manifest_doc}
+    """
+    if not manifest_path:
+        return {}
+
+    path = Path(manifest_path)
+    if not path.is_file():
+        LOG.warning("Video manifest not found: %s", manifest_path)
+        return {}
+
+    result: dict[str, dict[str, Any]] = {}
+    for doc in iter_jsonl(path):
+        vid = doc.get("video_id")
+        if vid:
+            result[str(vid)] = doc
+
+    LOG.info("Loaded video manifest: %d entries from %s", len(result), manifest_path)
+    return result
+
+
+def resolve_timestamp(
+    keyframe_idx: int,
+    keyframe_map: dict[int, dict[str, Any]],
+    num_keyframes: int,
+    video_manifest_entry: dict[str, Any] | None,
+    strategy: str,
+) -> tuple[float | None, str]:
+    """Resolve timestamp for a keyframe.
+
+    Args:
+        keyframe_idx: 1-based keyframe ordinal (from frame filename)
+        keyframe_map: loaded CSV map {n: {pts_time, fps, frame_idx}}
+        num_keyframes: total number of keyframes in this video
+        video_manifest_entry: optional manifest with duration_sec, fps
+        strategy: "map_or_uniform"|"map_only"|"uniform"|"none"
+
+    Returns:
+        tuple: (timestamp_sec, timestamp_source)
+    """
+    if strategy == "none":
+        return None, "none"
+
+    # Try map CSV first
+    if strategy in ("map_or_uniform", "map_only"):
+        if keyframe_idx in keyframe_map:
+            row = keyframe_map[keyframe_idx]
+            return row["pts_time"], "keyframe_map_csv"
+
+    if strategy == "map_only":
+        return None, "map_missing"
+
+    # Uniform interpolation fallback
+    if strategy in ("map_or_uniform", "uniform"):
+        duration = None
+        if video_manifest_entry:
+            duration = video_manifest_entry.get("duration_sec")
+        if duration and duration > 0 and num_keyframes > 1:
+            ts = (keyframe_idx - 1) * duration / max(1, num_keyframes - 1)
+            return round(ts, 6), "uniform_interpolation"
+
+    return None, "unavailable"
+
+
+# ============================================================================
+# RESUME FINGERPRINT
+# ============================================================================
+
+def compute_run_config_hash(args: argparse.Namespace) -> str:
+    """Compute a hash of the run configuration for resume fingerprinting."""
+    config_parts = [
+        f"schema={SCHEMA_VERSION}",
+        f"ram_image_size={args.ram_image_size}",
+        f"gdino_model_id={args.gdino_model_id}",
+        f"image_max_side={args.image_max_side}",
+        f"box_threshold={args.box_threshold}",
+        f"text_threshold={args.text_threshold}",
+        f"nms_iou_threshold={args.nms_iou_threshold}",
+        f"scene_area_threshold={args.scene_area_threshold}",
+        f"max_prompt_tags={args.max_prompt_tags}",
+    ]
+    config_str = "|".join(config_parts)
+    return hashlib.md5(config_str.encode()).hexdigest()[:12]
+
+
+def compute_frame_fingerprint(run_config_hash: str, image_path: Path) -> str:
+    """Compute fingerprint for a specific frame + run config combination."""
+    fp_str = f"{run_config_hash}|{image_path.name}"
+    return hashlib.md5(fp_str.encode()).hexdigest()[:16]
+
+
+def should_skip_frame(
+    frame_id: str,
+    frame_fingerprint: str,
+    existing_records: dict[str, str | None],
+    resume_legacy: bool,
+) -> bool:
+    """Determine whether a frame should be skipped during resume.
+
+    Args:
+        frame_id: frame identifier
+        frame_fingerprint: current run's fingerprint
+        existing_records: {frame_id: existing_fingerprint or None}
+        resume_legacy: if True, skip even when existing has no fingerprint
+
+    Returns:
+        bool: True if frame should be skipped
+    """
+    if frame_id not in existing_records:
+        return False
+
+    existing_fp = existing_records[frame_id]
+    if existing_fp is None:
+        # Legacy record — no fingerprint
+        if resume_legacy:
+            LOG.debug("Resume (legacy): skipping %s (no fingerprint in output)", frame_id)
+            return True
+        LOG.debug("Resume: re-running %s (legacy output, no fingerprint)", frame_id)
+        return False
+
+    if existing_fp == frame_fingerprint:
+        return True
+
+    LOG.debug("Resume: re-running %s (fingerprint mismatch: %s vs %s)",
+              frame_id, existing_fp, frame_fingerprint)
+    return False
 
 
 def find_ram_checkpoint(cli_path: str | None = None) -> str:
@@ -595,35 +832,73 @@ def build_frame_doc(
     raw_detections: list[dict[str, Any]],
     final_objects: list[dict[str, Any]],
     scene_labels: list[str],
+    quality_stats: dict[str, Any],
     timing: dict[str, float],
+    *,
+    keyframe_idx: int | None = None,
+    source_frame_idx: int | None = None,
+    timestamp_sec: float | None = None,
+    timestamp_source: str = "none",
+    frame_fingerprint: str | None = None,
+    run_config_hash: str | None = None,
 ) -> dict[str, Any]:
     img_w, img_h = image.size
-    label_counts = Counter(obj["label"] for obj in final_objects)
+    frame_id = make_frame_id(video_id, image_path)
     all_tags = unique_preserve_order([tag.lower() for tag in raw_tags] + scene_labels)
 
-    return {
+    # Build search/caption fields
+    search_fields = build_search_fields(final_objects, scene_labels, raw_tags)
+
+    # image_relpath: video_id/frame_name.ext
+    image_relpath = f"{video_id}/{image_path.name}"
+
+    doc = {
         "schema_version": SCHEMA_VERSION,
-        "frame_id": make_frame_id(video_id, image_path),
         "video_id": video_id,
-        "frame_idx": extract_frame_idx(image_path),
+        "frame_id": frame_id,
+        "canonical_frame_id": frame_id,
         "frame_name": image_path.stem,
+        "frame_idx": extract_frame_idx(image_path),
+        "keyframe_idx": keyframe_idx,
+        "source_frame_idx": source_frame_idx,
+        "timestamp_sec": timestamp_sec,
+        "timestamp_source": timestamp_source,
         "image_path": str(image_path.resolve()),
+        "image_relpath": image_relpath,
         "image_size": [img_w, img_h],
         "tags": all_tags,
         "raw_tags": raw_tags,
+        "ram_tags": search_fields["ram_tags"],
         "object_prompt_tags": prompt_tags,
+        "scene_tags": search_fields["scene_tags"],
+        "object_tags": search_fields["object_tags"],
         "objects": final_objects,
-        "object_summary": sorted(label_counts.keys()),
-        "object_counts": dict(label_counts),
+        "object_summary": sorted(search_fields["object_counts"].keys()),
+        "object_counts": search_fields["object_counts"],
+        "object_counts_normalized": search_fields["object_counts_normalized"],
+        "object_count_items": search_fields["object_count_items"],
+        "important_objects": search_fields["important_objects"],
+        "object_text": search_fields["object_text"],
+        "scene_text": search_fields["scene_text"],
+        "ram_tag_text": search_fields["ram_tag_text"],
+        "all_object_text": search_fields["all_object_text"],
         "quality": {
             "num_raw_tags": len(raw_tags),
             "num_prompt_tags": len(prompt_tags),
             "num_raw_boxes": len(raw_detections),
             "num_final_boxes": len(final_objects),
-            "num_scene_labels": len(scene_labels),
+            **quality_stats,
         },
         "timing": timing,
     }
+
+    # Resume fingerprint (Phase 7)
+    if frame_fingerprint:
+        doc["frame_fingerprint"] = frame_fingerprint
+    if run_config_hash:
+        doc["run_config_hash"] = run_config_hash
+
+    return doc
 
 
 def process_frame_batch(
@@ -635,10 +910,18 @@ def process_frame_batch(
     gdino_processor,
     device,
     args: argparse.Namespace,
+    *,
+    keyframe_map: dict[int, dict[str, Any]] | None = None,
+    num_keyframes: int = 0,
+    video_manifest_entry: dict[str, Any] | None = None,
+    run_config_hash: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     loaded_paths, images, load_errors = load_images(frame_paths)
     if not images:
         return [], load_errors
+
+    if keyframe_map is None:
+        keyframe_map = {}
 
     ram_start = time.time()
     ram_tag_groups = infer_ram_tags_batch(
@@ -675,7 +958,7 @@ def process_frame_batch(
         gdino_sec = time.time() - detect_start
 
         post_start = time.time()
-        final_objects, scene_labels = canonicalize_detections(
+        final_objects, scene_labels, quality_stats = canonicalize_detections(
             raw_detections,
             image.size[0],
             image.size[1],
@@ -683,6 +966,24 @@ def process_frame_batch(
             scene_area_threshold=args.scene_area_threshold,
         )
         post_sec = time.time() - post_start
+
+        # Timestamp resolution (Phase 1)
+        kf_idx = extract_frame_idx(image_path)
+        ts_sec, ts_source = resolve_timestamp(
+            keyframe_idx=kf_idx,
+            keyframe_map=keyframe_map,
+            num_keyframes=num_keyframes,
+            video_manifest_entry=video_manifest_entry,
+            strategy=getattr(args, "timestamp_strategy", "map_or_uniform"),
+        )
+
+        # Source frame idx from keyframe map
+        src_frame_idx = None
+        if kf_idx in keyframe_map:
+            src_frame_idx = keyframe_map[kf_idx].get("frame_idx")
+
+        # Frame fingerprint (Phase 7)
+        fp = compute_frame_fingerprint(run_config_hash, image_path) if run_config_hash else None
 
         docs.append(
             build_frame_doc(
@@ -694,11 +995,18 @@ def process_frame_batch(
                 raw_detections=raw_detections,
                 final_objects=final_objects,
                 scene_labels=scene_labels,
+                quality_stats=quality_stats,
                 timing={
                     "ram_sec": round(ram_sec, 4),
                     "gdino_sec": round(gdino_sec, 4),
                     "postprocess_sec": round(post_sec, 4),
                 },
+                keyframe_idx=kf_idx,
+                source_frame_idx=src_frame_idx,
+                timestamp_sec=ts_sec,
+                timestamp_source=ts_source,
+                frame_fingerprint=fp,
+                run_config_hash=run_config_hash,
             )
         )
 
@@ -715,13 +1023,30 @@ def run_single_video(
     gdino_processor,
     device,
     args: argparse.Namespace,
+    *,
+    keyframe_map: dict[int, dict[str, Any]] | None = None,
+    video_manifest_entry: dict[str, Any] | None = None,
+    run_config_hash: str | None = None,
 ) -> dict[str, Any]:
     frames = discover_frames(input_dir, pattern=args.pattern, limit=args.limit)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    existing_ids = load_existing_frame_ids(output_path) if args.resume else set()
-    write_mode = "a" if args.resume and existing_ids else "w"
+    # Resume with fingerprint support (Phase 7)
+    existing_records = load_existing_records(output_path) if args.resume else {}
+    write_mode = "a" if args.resume and existing_records else "w"
+
+    # Precompute run_config_hash if not provided
+    if run_config_hash is None:
+        run_config_hash = compute_run_config_hash(args)
+
+    # Load keyframe map if not provided
+    if keyframe_map is None:
+        keyframe_map = find_keyframe_map_for_video(
+            getattr(args, "keyframe_map", None), video_id
+        )
+
+    num_keyframes = len(frames)
 
     processed = 0
     skipped = 0
@@ -745,6 +1070,10 @@ def run_single_video(
                 gdino_processor,
                 device,
                 args,
+                keyframe_map=keyframe_map,
+                num_keyframes=num_keyframes,
+                video_manifest_entry=video_manifest_entry,
+                run_config_hash=run_config_hash,
             )
             errors += batch_errors
         except Exception as exc:
@@ -767,10 +1096,15 @@ def run_single_video(
         pbar = tqdm(frames, desc=f"RAM+GDINO {video_id}", unit="frame")
         for frame_path in pbar:
             frame_id = make_frame_id(video_id, frame_path)
-            if frame_id in existing_ids:
-                skipped += 1
-                pbar.set_postfix(ok=processed, skip=skipped, err=errors)
-                continue
+
+            # Fingerprint-aware resume (Phase 7)
+            if existing_records:
+                fp = compute_frame_fingerprint(run_config_hash, frame_path)
+                if should_skip_frame(frame_id, fp, existing_records,
+                                     getattr(args, "resume_legacy", True)):
+                    skipped += 1
+                    pbar.set_postfix(ok=processed, skip=skipped, err=errors)
+                    continue
 
             pending.append(frame_path)
             if len(pending) >= args.ram_batch_size:
@@ -799,6 +1133,8 @@ def run_single_video(
         "total_objects": total_objects,
         "elapsed_sec": round(elapsed, 3),
         "fps": round(processed / elapsed, 4) if elapsed > 0 else None,
+        "run_config_hash": run_config_hash,
+        "schema_version": SCHEMA_VERSION,
     }
     LOG.info(
         "[%s] Done: %d processed, %d skipped, %d errors, %.1fs",
@@ -826,10 +1162,23 @@ def run_batch(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Precompute config hash once
+    run_config_hash = compute_run_config_hash(args)
+
+    # Load video manifest once for all videos
+    video_manifest = load_video_manifest(getattr(args, "video_manifest", None))
+
     summaries: list[dict[str, Any]] = []
     for index, (video_id, video_path) in enumerate(video_dirs, 1):
         LOG.info("=== Video %d/%d: %s ===", index, len(video_dirs), video_id)
         output_path = output_dir / f"{video_id}_objects.jsonl"
+
+        # Per-video keyframe map
+        kf_map = find_keyframe_map_for_video(
+            getattr(args, "keyframe_map", None), video_id
+        )
+        vm_entry = video_manifest.get(video_id)
+
         summaries.append(
             run_single_video(
                 video_path,
@@ -841,6 +1190,9 @@ def run_batch(
                 gdino_processor,
                 device,
                 args,
+                keyframe_map=kf_map,
+                video_manifest_entry=vm_entry,
+                run_config_hash=run_config_hash,
             )
         )
 
@@ -884,15 +1236,19 @@ def main() -> None:
     device = get_device(args.device)
     log_device(device)
 
+    run_config_hash = compute_run_config_hash(args)
     LOG.info(
         "Config: ram_batch_size=%s, max_prompt_tags=%s, image_max_side=%s, "
-        "box_threshold=%.2f, text_threshold=%.2f, nms_iou=%.2f",
+        "box_threshold=%.2f, text_threshold=%.2f, nms_iou=%.2f, "
+        "schema=%s, config_hash=%s",
         args.ram_batch_size,
         args.max_prompt_tags,
         args.image_max_side,
         args.box_threshold,
         args.text_threshold,
         args.nms_iou_threshold,
+        SCHEMA_VERSION,
+        run_config_hash,
     )
 
     ram_model, ram_transform = load_ram_model(device, args.ram_checkpoint, args.ram_image_size)
@@ -911,6 +1267,13 @@ def main() -> None:
         )
     else:
         video_id = args.video_id or Path(args.input).name
+        # Load metadata for single video mode
+        kf_map = find_keyframe_map_for_video(
+            getattr(args, "keyframe_map", None), video_id
+        )
+        vm = load_video_manifest(getattr(args, "video_manifest", None))
+        vm_entry = vm.get(video_id)
+
         summaries = [
             run_single_video(
                 args.input,
@@ -922,6 +1285,9 @@ def main() -> None:
                 gdino_processor,
                 device,
                 args,
+                keyframe_map=kf_map,
+                video_manifest_entry=vm_entry,
+                run_config_hash=run_config_hash,
             )
         ]
 

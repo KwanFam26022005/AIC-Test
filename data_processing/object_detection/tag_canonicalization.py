@@ -5,17 +5,21 @@ tag_canonicalization.py — Xử lý hierarchy collision cho RAM++ + GroundingDI
 Pipeline:
     RAM++ tags → [Layer 1] filter → GroundingDINO → [Layer 2] NMS → [Layer 3] normalize → output
 
-3 Layers:
+4 Layers (v1.1):
     Layer 1: filter_tags_for_dino()  — Lọc tags trước khi gửi prompt (best-effort)
     Layer 2: class_agnostic_nms()    — Loại bbox trùng sau detect (PRIMARY defense)
+    Layer 2b: family_aware_nms()     — Dedup person-family hierarchy (PERSON/MAN/WOMAN)
     Layer 3: normalize_label()       — Chuẩn hóa label + loại bbox scene-level
+    Layer 4: enrich_detection()      — Thêm geometry metadata (position, size_bucket, etc.)
 
 Thiết kế:
     - Layer 2 (NMS) là phòng tuyến CHÍNH — hoạt động trên bbox IoU,
       không phụ thuộc label name → bắt 99% duplicates bất kể RAM++ output gì.
+    - Layer 2b (family NMS) xử lý hierarchy collision khi PERSON + MAN/WOMAN overlap.
     - Layer 1 (tag filter) là OPTIMIZATION — giảm prompt length, tăng tốc GDINO.
       Chỉ cover high-frequency collisions, KHÔNG cần exhaustive.
     - Layer 3 (normalize) chỉ xử lý edge cases từ GDINO token decoding.
+    - Layer 4 (enrich) thêm metadata cho caption/search downstream.
 
 Sử dụng:
     from tag_canonicalization import (
@@ -23,6 +27,13 @@ Sử dụng:
         class_agnostic_nms,
         normalize_and_filter,
         build_dino_prompt,
+        enrich_detection,
+        family_aware_nms,
+        canonicalize_detections,
+        build_object_counts,
+        build_object_text,
+        build_important_objects,
+        build_search_fields,
     )
 """
 
@@ -154,6 +165,50 @@ NON_OBJECT_TAGS = frozenset({
     "operate", "operation", "surgery", "perform", "job",
     "procedure", "treatment", "therapy", "diagnosis",
 })
+
+# --------------------------------------------------------------------------
+# SCENE LABELS — Labels nên phân loại thành scene_tags, không phải countable objects
+# Bắt cả trường hợp bbox nhỏ hơn scene_area_threshold nhưng label rõ ràng là scene.
+# --------------------------------------------------------------------------
+SCENE_LABELS = frozenset({
+    "SKY", "CITY", "CITY_SKYLINE", "CITY_VIEW", "WATER", "SEA", "SUN",
+    "SUNSET", "SUNRISE", "NIGHT", "NIGHT_VIEW", "ROAD", "LANDSCAPE",
+    "BACKGROUND", "OCEAN", "RIVER", "LAKE", "MOUNTAIN", "FIELD",
+    "FOREST", "BEACH", "DESERT", "SNOW", "RAIN", "FOG", "CLOUD",
+    "SKYLINE", "HORIZON",
+})
+
+# --------------------------------------------------------------------------
+# NON-COUNTABLE LABELS — Body parts, clothing items that shouldn't inflate counts
+# Giữ trong objects[] nếu cần evidence, nhưng countable=false.
+# --------------------------------------------------------------------------
+NON_COUNTABLE_LABELS = frozenset({
+    "HAND", "ARM", "LEG", "FACE", "HEAD", "FOOT", "FINGER",
+    "TIE", "UNIFORM", "DRESS_SHIRT", "SLEEVE", "COLLAR",
+})
+
+# --------------------------------------------------------------------------
+# COUNT_CANONICAL_MAP — Person-family hierarchy
+# MAN/WOMAN/BOY/GIRL → PERSON for counting purposes.
+# Giữ raw_label để biết model ban đầu detect gì.
+# --------------------------------------------------------------------------
+COUNT_CANONICAL_MAP = {
+    "MAN": "PERSON",
+    "WOMAN": "PERSON",
+    "BOY": "PERSON",
+    "GIRL": "PERSON",
+    "STUDENT": "PERSON",
+    "CHILD_STUDENT": "PERSON",
+    "CHILD": "PERSON",
+    "BABY": "PERSON",
+    "TEACHER": "PERSON",
+    "WORKER": "PERSON",
+    "DOCTOR": "PERSON",
+    "NURSE": "PERSON",
+    "SOLDIER": "PERSON",
+    "POLICE": "PERSON",
+    "OFFICER": "PERSON",
+}
 
 
 PRIORITY_TAGS = [
@@ -326,6 +381,109 @@ def class_agnostic_nms(detections, iou_threshold=0.7):
     return kept
 
 
+def compute_containment(box_a, box_b):
+    """Tính tỷ lệ box_a nằm trong box_b (containment ratio).
+
+    Args:
+        box_a, box_b: [x1, y1, x2, y2]
+
+    Returns:
+        float: Tỷ lệ diện tích phần giao / diện tích box_a ∈ [0, 1]
+    """
+    x0 = max(box_a[0], box_b[0])
+    y0 = max(box_a[1], box_b[1])
+    x1 = min(box_a[2], box_b[2])
+    y1 = min(box_a[3], box_b[3])
+
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+
+    intersection = (x1 - x0) * (y1 - y0)
+    area_a = max(0, (box_a[2] - box_a[0]) * (box_a[3] - box_a[1]))
+    return intersection / area_a if area_a > 0 else 0.0
+
+
+def canonical_count_label(label: str) -> str:
+    """Trả về canonical label cho counting (WOMAN → PERSON, etc.).
+
+    Args:
+        label: str — label uppercase đã normalize
+
+    Returns:
+        str: canonical label (uppercase)
+    """
+    return COUNT_CANONICAL_MAP.get(label, label)
+
+
+def family_aware_nms(detections, iou_threshold=0.5, containment_threshold=0.7):
+    """Loại bbox trùng trong cùng person-family hierarchy.
+
+    Khi PERSON và MAN/WOMAN overlap cao (IoU hoặc containment), giữ detection
+    confidence tốt hơn, gán canonical label = PERSON, giữ raw_label gốc.
+
+    Args:
+        detections: list[dict] — {"label", "score", "box", ...}
+        iou_threshold: float — IoU threshold cho family overlap
+        containment_threshold: float — containment threshold (box nhỏ nằm trong box lớn)
+
+    Returns:
+        list[dict]: detections đã xử lý family hierarchy
+    """
+    if not detections:
+        return []
+
+    # Tách family members vs non-family
+    family_labels = set(COUNT_CANONICAL_MAP.keys()) | set(COUNT_CANONICAL_MAP.values())
+    family_dets = []
+    non_family_dets = []
+
+    for det in detections:
+        if det.get("label", "") in family_labels:
+            family_dets.append(det)
+        else:
+            non_family_dets.append(det)
+
+    if len(family_dets) <= 1:
+        return detections
+
+    # Sort by score descending
+    family_dets.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)
+    kept_family = []
+
+    for det in family_dets:
+        is_duplicate = False
+        for existing in kept_family:
+            iou = compute_iou(det["box"], existing["box"])
+            containment = compute_containment(det["box"], existing["box"])
+            reverse_containment = compute_containment(existing["box"], det["box"])
+            max_containment = max(containment, reverse_containment)
+
+            if iou > iou_threshold or max_containment > containment_threshold:
+                # Overlap detected — merge: giữ existing (score cao hơn),
+                # nhưng lưu raw_label nếu cần
+                if "attributes" not in existing:
+                    existing["attributes"] = []
+                raw = det.get("raw_label") or det.get("label", "")
+                if raw.lower() not in [a.lower() for a in existing["attributes"]]:
+                    existing["attributes"].append(raw.lower())
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            # Gán canonical label cho counting
+            det_copy = dict(det)
+            raw_label = det_copy.get("label", "")
+            canonical = canonical_count_label(raw_label)
+            if canonical != raw_label:
+                det_copy["raw_label"] = raw_label
+                det_copy["label"] = canonical
+                if "attributes" not in det_copy:
+                    det_copy["attributes"] = [raw_label.lower()]
+            kept_family.append(det_copy)
+
+    return non_family_dets + kept_family
+
+
 # ============================================================================
 # LAYER 3 — Label Normalize + Scene-level Filter
 # ============================================================================
@@ -395,6 +553,10 @@ def normalize_and_filter(detections, img_width, img_height,
                          scene_threshold=SCENE_AREA_THRESHOLD):
     """Chuẩn hóa labels + loại bbox scene-level.
 
+    Scene-level detection bao gồm:
+    1. Bbox chiếm > scene_threshold diện tích ảnh.
+    2. Label nằm trong SCENE_LABELS (bất kể kích thước bbox).
+
     Args:
         detections: list[dict] — {"label", "score", "box"}
         img_width, img_height: kích thước ảnh
@@ -403,7 +565,7 @@ def normalize_and_filter(detections, img_width, img_height,
     Returns:
         tuple: (kept_objects, scene_labels)
             - kept_objects: list[dict] — objects hợp lệ, label đã normalize
-            - scene_labels: list[str] — labels bị loại (chuyển vào tags)
+            - scene_labels: list[str] — labels bị loại (chuyển vào scene_tags)
     """
     kept = []
     scene_labels = []
@@ -426,9 +588,13 @@ def normalize_and_filter(detections, img_width, img_height,
         clean_det["label"] = normalize_label(label)
         clean_det["box"] = clean_box
 
-        # Check scene-level
         area_ratio = compute_area_ratio(clean_box, img_width, img_height)
-        if area_ratio > scene_threshold:
+
+        # Check scene-level: by area OR by label name
+        is_scene_by_area = area_ratio > scene_threshold
+        is_scene_by_label = clean_det["label"] in SCENE_LABELS
+
+        if is_scene_by_area or is_scene_by_label:
             scene_labels.append(clean_det["label"].lower())
             continue
 
@@ -438,29 +604,299 @@ def normalize_and_filter(detections, img_width, img_height,
 
 
 # ============================================================================
+# LAYER 4 — Geometry Enrichment
+# ============================================================================
+
+def compute_position(bbox, img_width, img_height):
+    """Tính vị trí tương đối của bbox trong ảnh dựa trên center point.
+
+    Chia ảnh thành grid 3x3:
+        top_left    | top_center    | top_right
+        center_left | center        | center_right
+        bottom_left | bottom_center | bottom_right
+
+    Simplified thành left/center/right nếu chỉ cần ngang.
+
+    Args:
+        bbox: [x1, y1, x2, y2]
+        img_width, img_height: kích thước ảnh
+
+    Returns:
+        str: vị trí ("left", "center", "right", "top_left", etc.)
+    """
+    if img_width <= 0 or img_height <= 0:
+        return "center"
+
+    cx = (bbox[0] + bbox[2]) / 2.0
+    cy = (bbox[1] + bbox[3]) / 2.0
+    rx = cx / img_width
+    ry = cy / img_height
+
+    # Horizontal position
+    if rx < 1.0 / 3:
+        h_pos = "left"
+    elif rx > 2.0 / 3:
+        h_pos = "right"
+    else:
+        h_pos = "center"
+
+    # Vertical position
+    if ry < 1.0 / 3:
+        v_pos = "top"
+    elif ry > 2.0 / 3:
+        v_pos = "bottom"
+    else:
+        v_pos = "center"
+
+    # Combine
+    if v_pos == "center" and h_pos == "center":
+        return "center"
+    if v_pos == "center":
+        return h_pos
+    if h_pos == "center":
+        return v_pos
+    return f"{v_pos}_{h_pos}"
+
+
+def size_bucket(area_ratio: float) -> str:
+    """Phân loại kích thước bbox dựa trên area ratio.
+
+    Args:
+        area_ratio: float — tỷ lệ diện tích bbox / ảnh
+
+    Returns:
+        str: "small" | "medium" | "large"
+    """
+    if area_ratio < 0.01:
+        return "small"
+    if area_ratio < 0.08:
+        return "medium"
+    return "large"
+
+
+def enrich_detection(det, img_width, img_height):
+    """Thêm geometry metadata cho một detection.
+
+    Thêm các field:
+        - label_lower: lowercase label
+        - raw_label: label gốc trước canonical (nếu chưa có)
+        - confidence: alias cho score
+        - bbox_xyxy: alias cho box
+        - area_ratio: tỷ lệ diện tích
+        - center_xy: tọa độ tâm bbox
+        - position: vị trí tương đối trong ảnh
+        - size_bucket: phân loại kích thước
+        - countable: có nên đếm trong object_counts không
+
+    Args:
+        det: dict — detection {"label", "score", "box", ...}
+        img_width, img_height: kích thước ảnh
+
+    Returns:
+        dict: detection đã enriched (modified in-place)
+    """
+    box = det.get("box", [0, 0, 0, 0])
+    label = det.get("label", "")
+    score = det.get("score", 0.0)
+
+    # Geometry
+    area_ratio_val = compute_area_ratio(box, img_width, img_height)
+    cx = round((box[0] + box[2]) / 2.0, 2)
+    cy = round((box[1] + box[3]) / 2.0, 2)
+
+    # Aliases
+    det["label_lower"] = label.lower().replace("_", " ")
+    if "raw_label" not in det:
+        det["raw_label"] = label
+    det["confidence"] = score
+    det["bbox_xyxy"] = list(box)
+    det["area_ratio"] = round(area_ratio_val, 4)
+    det["center_xy"] = [cx, cy]
+    det["position"] = compute_position(box, img_width, img_height)
+    det["size_bucket"] = size_bucket(area_ratio_val)
+
+    # Countable flag
+    is_scene = label in SCENE_LABELS
+    is_non_countable = label in NON_COUNTABLE_LABELS
+    det["countable"] = not (is_scene or is_non_countable)
+
+    return det
+
+
+# ============================================================================
 # CONVENIENCE — Full canonicalization pipeline
 # ============================================================================
 
 def canonicalize_detections(raw_detections, img_width, img_height,
                            nms_iou_threshold=0.7,
-                           scene_area_threshold=SCENE_AREA_THRESHOLD):
-    """Chạy toàn bộ Layer 2 + Layer 3 trên raw detections.
+                           scene_area_threshold=SCENE_AREA_THRESHOLD,
+                           family_iou_threshold=0.5,
+                           family_containment_threshold=0.7):
+    """Chạy toàn bộ Layer 2 + 2b + 3 + 4 trên raw detections.
 
     Args:
         raw_detections: list[dict] — output thô từ GroundingDINO
         img_width, img_height: kích thước ảnh
         nms_iou_threshold: IoU threshold cho NMS
         scene_area_threshold: area ratio threshold cho scene filter
+        family_iou_threshold: IoU threshold cho person-family NMS
+        family_containment_threshold: containment threshold cho person-family NMS
 
     Returns:
-        tuple: (final_objects, scene_labels)
+        tuple: (final_objects, scene_labels, quality_stats)
     """
     # Layer 2: Class-agnostic NMS
     deduped = class_agnostic_nms(raw_detections, iou_threshold=nms_iou_threshold)
 
     # Layer 3: Normalize + scene filter
-    final_objects, scene_labels = normalize_and_filter(
+    objects_after_scene, scene_labels = normalize_and_filter(
         deduped, img_width, img_height, scene_threshold=scene_area_threshold
     )
 
-    return final_objects, scene_labels
+    # Layer 2b: Family-aware NMS (person hierarchy dedup)
+    num_before_family = len(objects_after_scene)
+    final_objects = family_aware_nms(
+        objects_after_scene,
+        iou_threshold=family_iou_threshold,
+        containment_threshold=family_containment_threshold,
+    )
+    num_deduped_hierarchy = num_before_family - len(final_objects)
+
+    # Layer 4: Enrich each detection with geometry metadata
+    for det in final_objects:
+        enrich_detection(det, img_width, img_height)
+
+    # Quality stats
+    num_countable = sum(1 for d in final_objects if d.get("countable", True))
+    num_non_countable = sum(1 for d in final_objects if not d.get("countable", True))
+
+    quality_stats = {
+        "num_deduped_hierarchy": num_deduped_hierarchy,
+        "num_countable_objects": num_countable,
+        "num_scene_labels": len(scene_labels),
+        "num_non_countable": num_non_countable,
+    }
+
+    return final_objects, scene_labels, quality_stats
+
+
+# ============================================================================
+# CAPTION / SEARCH FIELD BUILDERS
+# ============================================================================
+
+def build_object_counts(objects):
+    """Build object_counts (legacy uppercase) và object_counts_normalized (lowercase).
+
+    Chỉ đếm countable objects, bỏ qua scene labels và non-countable labels.
+
+    Args:
+        objects: list[dict] — enriched detections
+
+    Returns:
+        tuple: (object_counts, object_counts_normalized, object_count_items)
+    """
+    from collections import Counter
+
+    countable = [obj for obj in objects if obj.get("countable", True)]
+    counts_upper = Counter(obj["label"] for obj in countable)
+    counts_lower = Counter(obj.get("label_lower", obj["label"].lower()) for obj in countable)
+
+    object_counts = dict(counts_upper)
+    object_counts_normalized = dict(counts_lower)
+    object_count_items = [
+        {"label": label, "count": count}
+        for label, count in sorted(counts_lower.items(), key=lambda x: (-x[1], x[0]))
+    ]
+
+    return object_counts, object_counts_normalized, object_count_items
+
+
+def build_object_text(object_counts_normalized):
+    """Tạo text field cho lexical search.
+
+    Lặp label theo count để search ưu tiên frame có nhiều object.
+    Ví dụ: {"person": 2, "screen": 1} → "person person screen"
+
+    Args:
+        object_counts_normalized: dict[str, int]
+
+    Returns:
+        str: text field cho search index
+    """
+    parts = []
+    for label, count in sorted(object_counts_normalized.items(), key=lambda x: (-x[1], x[0])):
+        parts.extend([label] * count)
+    return " ".join(parts)
+
+
+def build_important_objects(object_counts_normalized):
+    """Tạo list human-readable object descriptions cho caption.
+
+    Ví dụ: {"person": 2, "screen": 1} → ["2 persons", "1 screen"]
+
+    Args:
+        object_counts_normalized: dict[str, int]
+
+    Returns:
+        list[str]: danh sách mô tả
+    """
+    items = []
+    for label, count in sorted(object_counts_normalized.items(), key=lambda x: (-x[1], x[0])):
+        # Simple English pluralization
+        if count > 1:
+            if label.endswith("s") or label.endswith("sh") or label.endswith("ch"):
+                plural = label + "es"
+            elif label.endswith("y") and label[-2:] not in ("ay", "ey", "oy", "uy"):
+                plural = label[:-1] + "ies"
+            else:
+                plural = label + "s"
+            items.append(f"{count} {plural}")
+        else:
+            items.append(f"{count} {label}")
+    return items
+
+
+def build_search_fields(objects, scene_labels, ram_tags):
+    """Build tất cả search/caption fields từ enriched objects.
+
+    Args:
+        objects: list[dict] — enriched detections (đã có countable, label_lower)
+        scene_labels: list[str] — labels bị loại ra scene
+        ram_tags: list[str] — RAM++ tags gốc (lowercase)
+
+    Returns:
+        dict: chứa tất cả search/caption fields
+    """
+    # Object counts
+    obj_counts, obj_counts_norm, obj_count_items = build_object_counts(objects)
+
+    # Tags
+    object_tags = sorted(set(
+        obj.get("label_lower", obj["label"].lower())
+        for obj in objects if obj.get("countable", True)
+    ))
+    scene_tags = sorted(set(scene_labels))
+    ram_tag_list = sorted(set(t.lower() for t in ram_tags))
+
+    # Text fields
+    object_text = build_object_text(obj_counts_norm)
+    scene_text = " ".join(scene_tags)
+    ram_tag_text = " ".join(ram_tag_list)
+    all_object_text = " ".join(filter(None, [object_text, scene_text, ram_tag_text]))
+
+    # Important objects
+    important_objects = build_important_objects(obj_counts_norm)
+
+    return {
+        "object_counts": obj_counts,
+        "object_counts_normalized": obj_counts_norm,
+        "object_count_items": obj_count_items,
+        "object_tags": object_tags,
+        "scene_tags": scene_tags,
+        "ram_tags": ram_tag_list,
+        "object_text": object_text,
+        "scene_text": scene_text,
+        "ram_tag_text": ram_tag_text,
+        "all_object_text": all_object_text,
+        "important_objects": important_objects,
+    }
