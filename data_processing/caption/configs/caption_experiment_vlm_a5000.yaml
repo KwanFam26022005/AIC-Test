@@ -1,0 +1,39 @@
+experiment:
+  name: vlm_frame_qwen25vl_7b_rep
+  video_id: L22_V012
+
+paths:
+  baseline_dir: ${AIC_ROOT}/caption
+  keyframes_root: ${AIC_ROOT}/keyframe_test
+  raw_output_root: ${AIC_ROOT}/caption_experiments_raw
+
+model:
+  # Providers supported by run_vlm_frame_caption_experiment.py:
+  #   qwen2_5_vl, internvl, mock
+  provider: qwen2_5_vl
+  model_name: Qwen/Qwen2.5-VL-7B-Instruct
+  dtype: bfloat16
+  device_map: auto
+  attn_implementation: flash_attention_2
+
+batch:
+  frame_selection: representative  # representative, sampled, all
+  sample_stride: 5
+  max_total_frames: 0
+  max_frames: 0
+  shard_index: 0
+  num_shards: 1
+  write_every: 20
+  resume: true
+  output_name: frame_caption_overrides.jsonl
+
+generation:
+  prompt_version: vlm_frame_caption_v1
+  prompt: >-
+    Describe this video frame for video retrieval. Mention visible people,
+    objects, scene, actions, and on-screen text if clear. Be factual,
+    concise, and avoid guessing.
+  max_new_tokens: 96
+  max_caption_chars: 420
+  do_sample: false
+  temperature: 0.0
