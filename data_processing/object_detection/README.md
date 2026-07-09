@@ -87,6 +87,16 @@ Override sample size:
 LIMIT=100 bash scripts/run_l22_v012_smoke.sh
 ```
 
+Visualize smoke-test detections:
+
+```bash
+python visualize_detections.py \
+  --jsonl ./outputs/object_detection/L22_V012_objects.jsonl \
+  --output-dir ./outputs/object_detection/visualized \
+  --frames-dir ./keyframe_test/L22_V012 \
+  --limit 20
+```
+
 ## Batch Run
 
 ```bash
