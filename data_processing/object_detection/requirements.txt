@@ -12,8 +12,14 @@ huggingface_hub>=0.23.0
 tokenizers>=0.20.0
 safetensors
 
-# RAM++.
-timm>=1.0.11
+# RAM++ runtime dependencies. The recognize-anything package does not publish
+# complete install_requires metadata, so keep the important upstream deps here.
+timm==0.4.12
+fairscale==0.4.4
+scipy>=1.10.0,<1.14.0
+ftfy>=6.1.1
+regex>=2023.0.0
+git+https://github.com/openai/CLIP.git
 git+https://github.com/xinyu1205/recognize-anything.git
 
 # Image/data/config utilities.

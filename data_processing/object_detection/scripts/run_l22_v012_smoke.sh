@@ -49,6 +49,11 @@ packages = {
     "PIL": "Pillow",
     "transformers": "transformers",
     "timm": "timm",
+    "scipy": "scipy",
+    "fairscale": "fairscale",
+    "clip": "CLIP",
+    "regex": "regex",
+    "ftfy": "ftfy",
     "ram": "recognize-anything",
     "cv2": "opencv-python-headless",
 }
