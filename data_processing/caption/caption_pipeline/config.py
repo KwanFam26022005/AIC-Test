@@ -51,6 +51,19 @@ class FrameCaptionConfig:
 
 
 @dataclass
+class ShotCaptionConfig:
+    """Phase 3 shot captioner configuration."""
+
+    caption_mode: str = "template"  # "template" or "llm"
+    max_ocr_chars: int = 220
+    max_audio_chars: int = 360
+    max_frame_caption_chars: int = 360
+    max_caption_chars: int = 520
+    max_temporal_caption_chars: int = 620
+    max_memory_chars: int = 500
+
+
+@dataclass
 class PipelineConfig:
     """Top-level configuration aggregating all sub-configs."""
 
@@ -63,6 +76,7 @@ class PipelineConfig:
     include_ocr_only_frames: bool = False
     timestamp_tolerance: float = 0.001
     enable_frame_captions: bool = False
+    enable_shot_captions: bool = False
 
     audio_alignment: AudioAlignmentConfig = field(
         default_factory=AudioAlignmentConfig,
@@ -75,6 +89,9 @@ class PipelineConfig:
     )
     frame_caption: FrameCaptionConfig = field(
         default_factory=FrameCaptionConfig,
+    )
+    shot_caption: ShotCaptionConfig = field(
+        default_factory=ShotCaptionConfig,
     )
 
     # ---- derived paths (populated by resolve_paths) ----
