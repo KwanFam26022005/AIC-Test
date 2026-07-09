@@ -36,6 +36,8 @@ python -m pip install \
   "tqdm>=4.65.0" \
   "PyYAML>=6.0.0"
 python -m pip install -r "${OBJECT_DIR}/requirements.txt"
+python -m pip install "clip @ git+https://github.com/openai/CLIP.git"
+python -m pip install "timm==0.4.12"
 python -m pip check
 
 python - <<'PY'
