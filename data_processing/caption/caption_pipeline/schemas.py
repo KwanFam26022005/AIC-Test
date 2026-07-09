@@ -9,6 +9,7 @@ SHOT_EVIDENCE_SCHEMA = "caption_shot_evidence_v1"
 # Caption index schemas
 FRAME_INDEX_SCHEMA = "caption_frame_index_v1"
 SHOT_INDEX_SCHEMA = "caption_shot_index_v1"
+EVENT_STEP_INDEX_SCHEMA = "caption_event_step_index_v1"
 
 # Search index schema
 COMPACT_SEARCH_SCHEMA = "caption_compact_search_v1"

@@ -64,6 +64,17 @@ class ShotCaptionConfig:
 
 
 @dataclass
+class TrakeEventConfig:
+    """Phase 4 TRAKE event-step builder configuration."""
+
+    event_mode: str = "template"  # "template" or "llm"
+    max_before_context_chars: int = 300
+    max_current_observation_chars: int = 420
+    max_after_context_chars: int = 300
+    max_trake_text_chars: int = 900
+
+
+@dataclass
 class PipelineConfig:
     """Top-level configuration aggregating all sub-configs."""
 
@@ -77,6 +88,7 @@ class PipelineConfig:
     timestamp_tolerance: float = 0.001
     enable_frame_captions: bool = False
     enable_shot_captions: bool = False
+    enable_trake_events: bool = False
 
     audio_alignment: AudioAlignmentConfig = field(
         default_factory=AudioAlignmentConfig,
@@ -92,6 +104,9 @@ class PipelineConfig:
     )
     shot_caption: ShotCaptionConfig = field(
         default_factory=ShotCaptionConfig,
+    )
+    trake_event: TrakeEventConfig = field(
+        default_factory=TrakeEventConfig,
     )
 
     # ---- derived paths (populated by resolve_paths) ----

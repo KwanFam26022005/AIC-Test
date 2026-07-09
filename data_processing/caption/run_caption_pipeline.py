@@ -4,6 +4,7 @@
 Phase 0/1: Evidence alignment, shot grouping, compact search index.
 Phase 2:   Frame-level caption generation (template or LLM mode).
 Phase 3:   Shot-level caption generation (template or LLM mode).
+Phase 4:   TRAKE event-step generation (template or LLM mode).
 
 Usage:
     python run_caption_pipeline.py \\
@@ -23,6 +24,8 @@ Outputs:
         shot_evidence.jsonl
       captions/
         frame_index.jsonl          (Phase 2)
+        shot_index.jsonl           (Phase 3)
+        event_step_index.jsonl     (Phase 4)
       indexes/
         compact_search_index.jsonl
       reports/
@@ -30,6 +33,10 @@ Outputs:
         evidence_alignment_report.md
         frame_caption_report.json   (Phase 2)
         frame_caption_report.md     (Phase 2)
+        shot_caption_report.json    (Phase 3)
+        shot_caption_report.md      (Phase 3)
+        event_step_report.json      (Phase 4)
+        event_step_report.md        (Phase 4)
 """
 
 from __future__ import annotations
@@ -50,9 +57,18 @@ from caption_pipeline.config import (
     PipelineConfig,
     ShotCaptionConfig,
     ShotGroupingConfig,
+    TrakeEventConfig,
 )
 from caption_pipeline.evidence_alignment import align_frames
 from caption_pipeline.evidence_builder import build_frame_evidence
+from caption_pipeline.event_step_index import (
+    build_event_step_index,
+    rebuild_compact_with_trake_text,
+)
+from caption_pipeline.event_step_report import (
+    build_event_step_report,
+    render_event_step_report_markdown,
+)
 from caption_pipeline.frame_caption_fuser import fuse_frame_captions
 from caption_pipeline.io_utils import write_json, write_jsonl, write_text
 from caption_pipeline.load_inputs import load_audio_features, load_objects, load_ocr
@@ -66,6 +82,7 @@ from caption_pipeline.shot_index import (
     build_shot_index,
     rebuild_compact_with_frame_and_shot_captions,
 )
+from caption_pipeline.trake_event_builder import build_trake_event_steps
 from caption_pipeline.validation import build_report, render_report_markdown
 
 logger = logging.getLogger("caption_pipeline")
@@ -73,7 +90,7 @@ logger = logging.getLogger("caption_pipeline")
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Caption evidence alignment & indexing pipeline (Phase 0/1/2).",
+        description="Caption evidence, caption, shot, and TRAKE event pipeline.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -122,6 +139,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    choices=["template", "llm"],
                    help="Shot caption generation mode (default: template)")
 
+    # Phase 4: TRAKE events
+    p.add_argument("--enable-trake-events", action="store_true",
+                   help="Enable Phase 4 TRAKE event-step generation")
+    p.add_argument("--trake-event-mode", default="template",
+                   choices=["template", "llm"],
+                   help="TRAKE event generation mode (default: template)")
+
     return p.parse_args(argv)
 
 
@@ -137,6 +161,7 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         include_ocr_only_frames=args.include_ocr_only_frames,
         enable_frame_captions=args.enable_frame_captions,
         enable_shot_captions=args.enable_shot_captions,
+        enable_trake_events=args.enable_trake_events,
         audio_alignment=AudioAlignmentConfig(
             frame_window_sec_before=args.frame_window_before,
             frame_window_sec_after=args.frame_window_after,
@@ -152,6 +177,9 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         ),
         shot_caption=ShotCaptionConfig(
             caption_mode=args.shot_caption_mode,
+        ),
+        trake_event=TrakeEventConfig(
+            event_mode=args.trake_event_mode,
         ),
     )
     cfg.resolve_paths()
@@ -171,6 +199,12 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.enable_shot_captions and not cfg.enable_frame_captions:
         print(
             "ERROR: Phase 3 requires --enable-frame-captions in this integrated pipeline.",
+            file=sys.stderr,
+        )
+        return 2
+    if cfg.enable_trake_events and not cfg.enable_shot_captions:
+        print(
+            "ERROR: Phase 4 requires --enable-shot-captions in this integrated pipeline.",
             file=sys.stderr,
         )
         return 2
@@ -240,6 +274,8 @@ def main(argv: list[str] | None = None) -> int:
     frame_index = []
     shot_caption_records = []
     shot_index = []
+    event_records = []
+    event_step_index = []
     if cfg.enable_frame_captions:
         logger.info("--- Phase 2: Generating frame captions ---")
         caption_records = fuse_frame_captions(frame_evidence, cfg)
@@ -304,6 +340,38 @@ def main(argv: list[str] | None = None) -> int:
         write_text(srpt_md_path, srpt_md)
         logger.info("Wrote shot caption report MD -> %s", srpt_md_path)
 
+    # ---- Phase 4: TRAKE event steps ----
+    if cfg.enable_trake_events:
+        logger.info("--- Phase 4: Generating TRAKE event steps ---")
+        event_records = build_trake_event_steps(shot_index, shot_evidence, cfg)
+
+        logger.info("--- Phase 4: Building event-step index ---")
+        event_step_index = build_event_step_index(
+            shot_index, shot_evidence, event_records,
+        )
+
+        es_path = Path(cfg.captions_dir) / "event_step_index.jsonl"
+        write_jsonl(es_path, event_step_index)
+        logger.info("Wrote %d event-step index -> %s", len(event_step_index), es_path)
+
+        if cfg.frame_caption.rebuild_compact_with_captions:
+            logger.info("--- Phase 4: Rebuilding compact index with TRAKE text ---")
+            compact_docs = rebuild_compact_with_trake_text(compact_docs, event_records)
+            write_jsonl(idx_path, compact_docs)
+            logger.info("Rebuilt %d search docs -> %s", len(compact_docs), idx_path)
+
+        event_report = build_event_step_report(
+            cfg.video_id, event_step_index, event_records,
+        )
+        erpt_json_path = Path(cfg.reports_dir) / "event_step_report.json"
+        write_json(erpt_json_path, event_report)
+        logger.info("Wrote event-step report JSON -> %s", erpt_json_path)
+
+        erpt_md_path = Path(cfg.reports_dir) / "event_step_report.md"
+        erpt_md = render_event_step_report_markdown(event_report)
+        write_text(erpt_md_path, erpt_md)
+        logger.info("Wrote event-step report MD -> %s", erpt_md_path)
+
     elapsed = time.monotonic() - t0
 
     # ---- Summary ----
@@ -318,6 +386,9 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.enable_shot_captions:
         num_shot_cap = sum(1 for si in shot_index if si.get("caption_text"))
         logger.info("  Shot captions: %d/%d", num_shot_cap, len(shot_index))
+    if cfg.enable_trake_events:
+        num_trake = sum(1 for es in event_step_index if es.get("trake_text"))
+        logger.info("  Event steps: %d/%d", num_trake, len(event_step_index))
 
     # Print quick acceptance
     problems = []
@@ -339,6 +410,26 @@ def main(argv: list[str] | None = None) -> int:
             problems.append(f"{num_empty_shots} empty shot captions")
         if num_empty_temporal > 0:
             problems.append(f"{num_empty_temporal} empty temporal captions")
+    if cfg.enable_trake_events:
+        num_empty_events = sum(1 for es in event_step_index if not es.get("event_caption"))
+        num_empty_trake = sum(1 for es in event_step_index if not es.get("trake_text"))
+        duplicate_event_doc_ids = _count_duplicates(event_step_index, "document_id")
+        duplicate_event_ids = _count_duplicates(event_step_index, "event_id")
+        duplicate_event_shot_ids = _count_duplicates(event_step_index, "shot_id")
+        if len(event_step_index) != len(shot_index):
+            problems.append(
+                f"event steps ({len(event_step_index)}) != shots ({len(shot_index)})"
+            )
+        if num_empty_events > 0:
+            problems.append(f"{num_empty_events} empty event captions")
+        if num_empty_trake > 0:
+            problems.append(f"{num_empty_trake} empty TRAKE texts")
+        if duplicate_event_doc_ids > 0:
+            problems.append(f"{duplicate_event_doc_ids} duplicate event document_ids")
+        if duplicate_event_ids > 0:
+            problems.append(f"{duplicate_event_ids} duplicate event_ids")
+        if duplicate_event_shot_ids > 0:
+            problems.append(f"{duplicate_event_shot_ids} duplicate event shot_ids")
 
     if problems:
         logger.warning("Acceptance issues: %s", "; ".join(problems))
@@ -346,6 +437,17 @@ def main(argv: list[str] | None = None) -> int:
     else:
         logger.info("All acceptance checks passed.")
         return 0
+
+
+def _count_duplicates(rows: list[dict], key: str) -> int:
+    seen: set[str] = set()
+    duplicates = 0
+    for row in rows:
+        value = row.get(key, "")
+        if value in seen:
+            duplicates += 1
+        seen.add(value)
+    return duplicates
 
 
 if __name__ == "__main__":
