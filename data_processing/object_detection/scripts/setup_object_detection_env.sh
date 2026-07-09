@@ -27,6 +27,14 @@ conda activate "${ENV_DIR}"
 
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install torch torchvision --index-url "${TORCH_INDEX_URL}"
+python -m pip install \
+  "timm==0.4.12" \
+  "fairscale==0.4.4" \
+  "scipy>=1.10.0,<1.14.0" \
+  "ftfy>=6.1.1" \
+  "regex>=2023.0.0" \
+  "tqdm>=4.65.0" \
+  "PyYAML>=6.0.0"
 python -m pip install -r "${OBJECT_DIR}/requirements.txt"
 python -m pip check
 
