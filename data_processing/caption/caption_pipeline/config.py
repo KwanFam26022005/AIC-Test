@@ -43,6 +43,14 @@ class ShotGroupingConfig:
 
 
 @dataclass
+class FrameCaptionConfig:
+    """Phase 2 frame caption fuser configuration."""
+
+    caption_mode: str = "template"  # "template" or "llm"
+    rebuild_compact_with_captions: bool = False
+
+
+@dataclass
 class PipelineConfig:
     """Top-level configuration aggregating all sub-configs."""
 
@@ -54,6 +62,7 @@ class PipelineConfig:
     output_dir: str = ""
     include_ocr_only_frames: bool = False
     timestamp_tolerance: float = 0.001
+    enable_frame_captions: bool = False
 
     audio_alignment: AudioAlignmentConfig = field(
         default_factory=AudioAlignmentConfig,
@@ -64,9 +73,13 @@ class PipelineConfig:
     shot_grouping: ShotGroupingConfig = field(
         default_factory=ShotGroupingConfig,
     )
+    frame_caption: FrameCaptionConfig = field(
+        default_factory=FrameCaptionConfig,
+    )
 
     # ---- derived paths (populated by resolve_paths) ----
     evidence_dir: str = ""
+    captions_dir: str = ""
     indexes_dir: str = ""
     reports_dir: str = ""
 
@@ -74,5 +87,6 @@ class PipelineConfig:
         """Set derived output directories based on *output_dir* and *video_id*."""
         base = Path(self.output_dir) / self.video_id
         self.evidence_dir = str(base / "evidence")
+        self.captions_dir = str(base / "captions")
         self.indexes_dir = str(base / "indexes")
         self.reports_dir = str(base / "reports")

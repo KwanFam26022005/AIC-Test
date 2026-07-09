@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
 """Caption evidence pipeline - CLI entry point.
 
+Phase 0/1: Evidence alignment, shot grouping, compact search index.
+Phase 2:   Frame-level caption generation (template or LLM mode).
+
 Usage:
     python run_caption_pipeline.py \\
         --video-id L22_V012 \\
         --ocr-jsonl outputs/ocr_vlm_pipeline_v2/L22_V012/L22_V012_ocr_es_docs.jsonl \\
         --object-jsonl outputs/object_detection/L22_V012_objects.jsonl \\
         --audio-features outputs/audio/L22_V012/features/audio_features.jsonl \\
-        --output-dir outputs/caption
+        --output-dir outputs/caption \\
+        --enable-frame-captions \\
+        --caption-mode template \\
+        --rebuild-compact-with-captions
 
 Outputs:
     outputs/caption/<video_id>/
       evidence/
         frame_evidence.jsonl
         shot_evidence.jsonl
+      captions/
+        frame_index.jsonl          (Phase 2)
       indexes/
         compact_search_index.jsonl
       reports/
         evidence_alignment_report.json
         evidence_alignment_report.md
+        frame_caption_report.json   (Phase 2)
+        frame_caption_report.md     (Phase 2)
 """
 
 from __future__ import annotations
@@ -29,15 +39,19 @@ import sys
 import time
 from pathlib import Path
 
+from caption_pipeline.caption_index import build_frame_index, rebuild_compact_with_captions
+from caption_pipeline.caption_report import build_caption_report, render_caption_report_markdown
 from caption_pipeline.compact_index import build_compact_index
 from caption_pipeline.config import (
     AudioAlignmentConfig,
     EvidenceBuilderConfig,
+    FrameCaptionConfig,
     PipelineConfig,
     ShotGroupingConfig,
 )
 from caption_pipeline.evidence_alignment import align_frames
 from caption_pipeline.evidence_builder import build_frame_evidence
+from caption_pipeline.frame_caption_fuser import fuse_frame_captions
 from caption_pipeline.io_utils import write_json, write_jsonl, write_text
 from caption_pipeline.load_inputs import load_audio_features, load_objects, load_ocr
 from caption_pipeline.shot_grouper import group_shots
@@ -48,7 +62,7 @@ logger = logging.getLogger("caption_pipeline")
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Caption evidence alignment & indexing pipeline (Phase 0/1).",
+        description="Caption evidence alignment & indexing pipeline (Phase 0/1/2).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -81,6 +95,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Include frames with OCR but no object detection")
     p.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
 
+    # Phase 2: Frame captions
+    p.add_argument("--enable-frame-captions", action="store_true",
+                   help="Enable Phase 2 frame caption generation")
+    p.add_argument("--caption-mode", default="template",
+                   choices=["template", "llm"],
+                   help="Caption generation mode (default: template)")
+    p.add_argument("--rebuild-compact-with-captions", action="store_true",
+                   help="Rebuild compact search index with caption_text")
+
     return p.parse_args(argv)
 
 
@@ -94,6 +117,7 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         keyframe_map=args.keyframe_map,
         output_dir=args.output_dir,
         include_ocr_only_frames=args.include_ocr_only_frames,
+        enable_frame_captions=args.enable_frame_captions,
         audio_alignment=AudioAlignmentConfig(
             frame_window_sec_before=args.frame_window_before,
             frame_window_sec_after=args.frame_window_after,
@@ -102,6 +126,10 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         shot_grouping=ShotGroupingConfig(
             max_gap_sec=args.shot_max_gap_sec,
             max_shot_duration_sec=args.shot_max_duration_sec,
+        ),
+        frame_caption=FrameCaptionConfig(
+            caption_mode=args.caption_mode,
+            rebuild_compact_with_captions=args.rebuild_compact_with_captions,
         ),
     )
     cfg.resolve_paths()
@@ -150,8 +178,8 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("--- Phase 1: Building compact search index ---")
     compact_docs = build_compact_index(frame_evidence, shot_evidence)
 
-    # ---- Write outputs ----
-    logger.info("--- Writing outputs ---")
+    # ---- Write Phase 0/1 outputs ----
+    logger.info("--- Writing Phase 0/1 outputs ---")
 
     # Evidence
     fe_path = Path(cfg.evidence_dir) / "frame_evidence.jsonl"
@@ -178,6 +206,39 @@ def main(argv: list[str] | None = None) -> int:
     write_text(rpt_md_path, md_text)
     logger.info("Wrote report MD -> %s", rpt_md_path)
 
+    # ---- Phase 2: Frame captions ----
+    caption_records = []
+    frame_index = []
+    if cfg.enable_frame_captions:
+        logger.info("--- Phase 2: Generating frame captions ---")
+        caption_records = fuse_frame_captions(frame_evidence, cfg)
+
+        logger.info("--- Phase 2: Building frame index ---")
+        frame_index = build_frame_index(frame_evidence, caption_records)
+
+        # Write frame index
+        fi_path = Path(cfg.captions_dir) / "frame_index.jsonl"
+        write_jsonl(fi_path, frame_index)
+        logger.info("Wrote %d frame index -> %s", len(frame_index), fi_path)
+
+        # Rebuild compact index with captions if requested
+        if cfg.frame_caption.rebuild_compact_with_captions:
+            logger.info("--- Phase 2: Rebuilding compact index with captions ---")
+            compact_docs = rebuild_compact_with_captions(compact_docs, caption_records)
+            write_jsonl(idx_path, compact_docs)
+            logger.info("Rebuilt %d search docs -> %s", len(compact_docs), idx_path)
+
+        # Caption report
+        caption_report = build_caption_report(cfg.video_id, frame_index, caption_records)
+        crpt_json_path = Path(cfg.reports_dir) / "frame_caption_report.json"
+        write_json(crpt_json_path, caption_report)
+        logger.info("Wrote caption report JSON -> %s", crpt_json_path)
+
+        crpt_md_path = Path(cfg.reports_dir) / "frame_caption_report.md"
+        crpt_md = render_caption_report_markdown(caption_report)
+        write_text(crpt_md_path, crpt_md)
+        logger.info("Wrote caption report MD -> %s", crpt_md_path)
+
     elapsed = time.monotonic() - t0
 
     # ---- Summary ----
@@ -186,6 +247,9 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("  Shots:   %d", len(shot_evidence))
     logger.info("  Index:   %d docs", len(compact_docs))
     logger.info("  Warnings: %d", len(report.get("warnings", [])))
+    if cfg.enable_frame_captions:
+        num_cap = sum(1 for fi in frame_index if fi.get("caption_text"))
+        logger.info("  Captions: %d/%d", num_cap, len(frame_index))
 
     # Print quick acceptance
     problems = []
@@ -195,6 +259,11 @@ def main(argv: list[str] | None = None) -> int:
         problems.append(f"{report['num_frames_missing_ocr']} frames missing OCR")
     if report["num_frame_evidence"] != report["num_joined_frames"]:
         problems.append("frame evidence count != joined frames")
+
+    if cfg.enable_frame_captions:
+        num_empty = sum(1 for fi in frame_index if not fi.get("caption_text"))
+        if num_empty > 0:
+            problems.append(f"{num_empty} empty captions")
 
     if problems:
         logger.warning("Acceptance issues: %s", "; ".join(problems))

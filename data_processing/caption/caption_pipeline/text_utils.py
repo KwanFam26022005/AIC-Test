@@ -36,6 +36,7 @@ def dedup_tokens(text: str) -> str:
 
 def remove_accents(text: str) -> str:
     """Strip combining marks (diacritics) from *text*."""
+    text = text.replace("Đ", "D").replace("đ", "d")
     nfkd = unicodedata.normalize("NFKD", text)
     return "".join(c for c in nfkd if unicodedata.category(c) != "Mn")
 
