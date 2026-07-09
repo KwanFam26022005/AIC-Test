@@ -49,6 +49,7 @@ packages = {
     "PIL": "Pillow",
     "transformers": "transformers",
     "timm": "timm",
+    "ram": "recognize-anything",
     "cv2": "opencv-python-headless",
 }
 

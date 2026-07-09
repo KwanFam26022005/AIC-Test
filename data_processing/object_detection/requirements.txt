@@ -14,7 +14,7 @@ safetensors
 
 # RAM++.
 timm>=1.0.11
-recognize-anything
+git+https://github.com/xinyu1205/recognize-anything.git
 
 # Image/data/config utilities.
 Pillow>=10.0.0
