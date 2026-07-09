@@ -34,6 +34,36 @@ fi
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${ENV_DIR}"
 
+echo "Python:        $(command -v python)"
+echo "Pip:           $(python -m pip --version)"
+
+python - <<'PY'
+import importlib.util
+import sys
+
+packages = {
+    "tqdm": "tqdm",
+    "yaml": "PyYAML",
+    "torch": "torch",
+    "torchvision": "torchvision",
+    "PIL": "Pillow",
+    "transformers": "transformers",
+    "timm": "timm",
+    "cv2": "opencv-python-headless",
+}
+
+missing = [pip_name for module_name, pip_name in packages.items() if importlib.util.find_spec(module_name) is None]
+if missing:
+    print("Missing Python packages in the active object detection env:", file=sys.stderr)
+    for name in missing:
+        print(f"  - {name}", file=sys.stderr)
+    print("\nInstall/fix the env with:", file=sys.stderr)
+    print("  bash scripts/setup_object_detection_env.sh", file=sys.stderr)
+    print("or, after activating the env:", file=sys.stderr)
+    print("  python -m pip install -r requirements.txt", file=sys.stderr)
+    sys.exit(1)
+PY
+
 mkdir -p "${OUTPUT_DIR}" "${OUTPUT_DIR}/summaries"
 
 echo "Project root: ${PROJECT_ROOT}"

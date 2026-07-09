@@ -28,6 +28,30 @@ conda activate "${ENV_DIR}"
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install torch torchvision --index-url "${TORCH_INDEX_URL}"
 python -m pip install -r "${OBJECT_DIR}/requirements.txt"
+python -m pip check
+
+python - <<'PY'
+import importlib.util
+import sys
+
+packages = {
+    "tqdm": "tqdm",
+    "yaml": "PyYAML",
+    "torch": "torch",
+    "torchvision": "torchvision",
+    "PIL": "Pillow",
+    "transformers": "transformers",
+    "timm": "timm",
+    "cv2": "opencv-python-headless",
+}
+
+missing = [pip_name for module_name, pip_name in packages.items() if importlib.util.find_spec(module_name) is None]
+if missing:
+    print("Missing Python packages after install:", file=sys.stderr)
+    for name in missing:
+        print(f"  - {name}", file=sys.stderr)
+    sys.exit(1)
+PY
 
 cat <<EOF
 
