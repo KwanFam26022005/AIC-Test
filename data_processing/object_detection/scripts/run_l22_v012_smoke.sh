@@ -11,7 +11,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/object_detection}"
 CONFIG_PATH="${CONFIG_PATH:-${OBJECT_DIR}/configs/object_detection_a5000.yaml}"
 VIDEO_ID="${VIDEO_ID:-L22_V012}"
 LIMIT="${LIMIT:-20}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4}"
 RAM_CHECKPOINT_PATH="${RAM_CHECKPOINT_PATH:-/tmp2/maitanha/vgu/ttn/AIC-Khoa/models/ram_plus_swin_large_14m.pth}"
 HF_HOME="${HF_HOME:-/tmp2/maitanha/vgu/ttn/AIC-Khoa/hf_cache}"
 
