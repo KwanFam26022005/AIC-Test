@@ -156,7 +156,15 @@ NON_OBJECT_TAGS = frozenset({
 })
 
 
-def filter_tags_for_dino(raw_tags):
+PRIORITY_TAGS = [
+    "person", "car", "motorcycle", "bicycle", "bus", "truck", "boat",
+    "train", "airplane", "traffic light", "sign", "dog", "cat", "cow",
+    "horse", "fish", "bird", "chair", "table", "sofa", "bed", "phone",
+    "laptop", "bag", "backpack", "bottle", "cup", "hat", "shoe",
+]
+
+
+def filter_tags_for_dino(raw_tags, max_tags=None):
     """Lọc tags từ RAM++ trước khi gửi làm prompt cho GroundingDINO.
 
     Mục đích: Giảm prompt length → GDINO inference nhanh hơn + giảm duplicates.
@@ -165,6 +173,7 @@ def filter_tags_for_dino(raw_tags):
 
     Args:
         raw_tags: list[str] — tags gốc từ RAM++
+        max_tags: int | None — giới hạn số tag object gửi sang GroundingDINO
 
     Returns:
         list[str]: tags đã lọc, sẵn sàng cho build_dino_prompt()
@@ -202,7 +211,28 @@ def filter_tags_for_dino(raw_tags):
                 continue
         filtered.append(tag)
 
+    if max_tags is not None and max_tags > 0 and len(filtered) > max_tags:
+        filtered = limit_prompt_tags(filtered, max_tags)
+
     return filtered
+
+
+def limit_prompt_tags(tags, max_tags):
+    """Giới hạn prompt tags nhưng ưu tiên object quan trọng cho retrieval."""
+    priority_set = set(PRIORITY_TAGS)
+    priority = [tag for tag in tags if tag in priority_set]
+    rest = [tag for tag in tags if tag not in priority_set]
+
+    out = []
+    seen = set()
+    for tag in priority + rest:
+        if tag in seen:
+            continue
+        out.append(tag)
+        seen.add(tag)
+        if len(out) >= max_tags:
+            break
+    return out
 
 
 # ============================================================================
@@ -279,7 +309,7 @@ def class_agnostic_nms(detections, iou_threshold=0.7):
         return []
 
     # Sort by score descending — giữ detection có confidence cao nhất
-    sorted_dets = sorted(detections, key=lambda d: d["score"], reverse=True)
+    sorted_dets = sorted(detections, key=lambda d: float(d.get("score", 0.0)), reverse=True)
     kept = []
 
     for det in sorted_dets:
@@ -347,6 +377,20 @@ def compute_area_ratio(bbox, img_width, img_height):
     return box_area / img_area if img_area > 0 else 0.0
 
 
+def clamp_box(bbox, img_width, img_height):
+    """Clamp bbox vào biên ảnh và chuẩn hóa thứ tự tọa độ."""
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    x1 = max(0.0, min(float(img_width), x1))
+    y1 = max(0.0, min(float(img_height), y1))
+    x2 = max(0.0, min(float(img_width), x2))
+    y2 = max(0.0, min(float(img_height), y2))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    return [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)]
+
+
 def normalize_and_filter(detections, img_width, img_height,
                          scene_threshold=SCENE_AREA_THRESHOLD):
     """Chuẩn hóa labels + loại bbox scene-level.
@@ -365,16 +409,30 @@ def normalize_and_filter(detections, img_width, img_height,
     scene_labels = []
 
     for det in detections:
-        # Normalize label
-        det["label"] = normalize_label(det["label"])
-
-        # Check scene-level
-        area_ratio = compute_area_ratio(det["box"], img_width, img_height)
-        if area_ratio > scene_threshold:
-            scene_labels.append(det["label"].lower())
+        box = det.get("box")
+        label = det.get("label")
+        if not label or not isinstance(box, (list, tuple)) or len(box) != 4:
             continue
 
-        kept.append(det)
+        try:
+            clean_box = clamp_box(box, img_width, img_height)
+        except (TypeError, ValueError):
+            continue
+
+        if clean_box[2] <= clean_box[0] or clean_box[3] <= clean_box[1]:
+            continue
+
+        clean_det = dict(det)
+        clean_det["label"] = normalize_label(label)
+        clean_det["box"] = clean_box
+
+        # Check scene-level
+        area_ratio = compute_area_ratio(clean_box, img_width, img_height)
+        if area_ratio > scene_threshold:
+            scene_labels.append(clean_det["label"].lower())
+            continue
+
+        kept.append(clean_det)
 
     return kept, scene_labels
 

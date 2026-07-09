@@ -1,21 +1,24 @@
-# ==============================================================================
-# Requirements for RAM++ & GroundingDINO Object Detection Pipeline
-# ==============================================================================
+# RAM++ + GroundingDINO object detection dependencies.
+# Install the CUDA PyTorch wheels first on the server, then install this file.
 
-# Core deep learning framework (Recommended to be pre-installed with CUDA support)
-torch>=2.0.0
-torchvision>=0.15.0
+# Core deep learning framework. Kept here so pip sees already-installed CUDA
+# wheels as satisfying the requirement.
+torch>=2.3.0
+torchvision>=0.18.0
 
-# HuggingFace Transformers (MUST pin to 4.46.3 for RAM++ / GroundingDINO compatibility)
+# GroundingDINO through HuggingFace Transformers.
 transformers==4.46.3
-huggingface_hub
+huggingface_hub>=0.23.0
+tokenizers>=0.20.0
+safetensors
 
-# RAM++ Dependencies
-timm>=0.4.12
+# RAM++.
+timm>=1.0.11
 recognize-anything
 
-# Image & data processing utilities
-Pillow>=9.0.0
+# Image/data/config utilities.
+Pillow>=10.0.0
 tqdm>=4.65.0
-numpy>=1.20.0
-opencv-python>=4.7.0.0
+numpy>=1.24.0,<2.0.0
+opencv-python-headless>=4.8.0.0
+PyYAML>=6.0.0

@@ -1,0 +1,32 @@
+pipeline:
+  name: ram_plus_groundingdino_object_detection
+  version: "0.2.0"
+  schema_version: ram_gdino_object_detection_v1
+
+io:
+  pattern: "*.jpg"
+  batch: false
+  resume: true
+  flush_every: 1
+
+runtime:
+  device: auto
+  hf_cache_dir: /tmp2/maitanha/vgu/ttn/AIC-Khoa/hf_cache
+  amp: true
+  allow_tf32: true
+
+ram:
+  checkpoint: /tmp2/maitanha/vgu/ttn/AIC-Khoa/models/ram_plus_swin_large_14m.pth
+  image_size: 384
+  batch_size: 16
+  max_prompt_tags: 25
+
+grounding_dino:
+  model_id: IDEA-Research/grounding-dino-base
+  image_max_side: 1280
+  box_threshold: 0.30
+  text_threshold: 0.25
+
+postprocess:
+  nms_iou_threshold: 0.70
+  scene_area_threshold: 0.60
