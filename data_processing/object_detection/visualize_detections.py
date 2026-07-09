@@ -59,6 +59,10 @@ def resolve_image_path(
     video_id = str(doc.get("video_id") or "")
     candidates: list[Path] = []
 
+    image_relpath = doc.get("image_relpath")
+    if frames_root and image_relpath:
+        candidates.append(Path(frames_root) / str(image_relpath))
+
     if frames_dir and frame_name:
         base = Path(frames_dir)
         candidates.extend(base / f"{frame_name}{ext}" for ext in IMAGE_EXTENSIONS)

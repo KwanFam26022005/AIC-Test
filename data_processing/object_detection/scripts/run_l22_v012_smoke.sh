@@ -10,6 +10,8 @@ TEST_FRAMES="${TEST_FRAMES:-${PROJECT_ROOT}/keyframe_test/L22_V012}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/object_detection}"
 CONFIG_PATH="${CONFIG_PATH:-${OBJECT_DIR}/configs/object_detection_a5000.yaml}"
 VIDEO_ID="${VIDEO_ID:-L22_V012}"
+KEYFRAME_MAP="${KEYFRAME_MAP:-${PROJECT_ROOT}/keyframe_test}"
+FRAMES_ROOT="${FRAMES_ROOT:-${PROJECT_ROOT}/keyframe_test}"
 LIMIT="${LIMIT:-20}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4}"
 RAM_CHECKPOINT_PATH="${RAM_CHECKPOINT_PATH:-/tmp2/maitanha/vgu/ttn/AIC-Khoa/models/ram_plus_swin_large_14m.pth}"
@@ -76,6 +78,7 @@ echo "Project root: ${PROJECT_ROOT}"
 echo "Object dir:    ${OBJECT_DIR}"
 echo "Env:           ${ENV_DIR}"
 echo "Frames:        ${TEST_FRAMES}"
+echo "Keyframe map:  ${KEYFRAME_MAP}"
 echo "Output dir:    ${OUTPUT_DIR}"
 echo "GPU:           CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
@@ -84,6 +87,8 @@ python "${OBJECT_DIR}/ram_gdino_pipeline.py" \
   --input "${TEST_FRAMES}" \
   --output "${OUTPUT_DIR}/${VIDEO_ID}_objects.jsonl" \
   --video-id "${VIDEO_ID}" \
+  --keyframe-map "${KEYFRAME_MAP}" \
+  --frames-root "${FRAMES_ROOT}" \
   --limit "${LIMIT}" \
   --summary-output "${OUTPUT_DIR}/summaries/${VIDEO_ID}_summary.json" \
   "$@"

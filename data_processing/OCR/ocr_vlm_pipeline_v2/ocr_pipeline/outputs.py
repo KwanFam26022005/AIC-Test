@@ -27,6 +27,8 @@ from .structural_filter import classify_noise_text
 
 logger = logging.getLogger(__name__)
 
+SCHEMA_VERSION = "ocr_vlm_pipeline_v2_es_2"
+
 
 # ── Text aggregation ─────────────────────────────────────────────────
 
@@ -88,7 +90,7 @@ def build_group_text_clean_review(
                 num_filtered += 1
                 continue
 
-            if line.get("keep_for_index", False) and final_text:
+            if line.get("keep_for_index", False) and not line.get("need_review", False) and final_text:
                 clean_lines.append(final_text)
                 num_keep += 1
             elif final_text:
@@ -253,6 +255,7 @@ def build_es_document(
     cfg: dict,
     image_path: str,
     timing: dict | None = None,
+    metadata: dict | None = None,
 ) -> dict:
     """Build an ES-friendly frame OCR document.
 
@@ -264,9 +267,15 @@ def build_es_document(
     Line/group arrays keep evidence for UI inspection and debugging.
     """
     image = Path(image_path)
-    frame_id = Path(image_path).stem
-    frame_number = _parse_frame_number(frame_id)
-    video_id = image.parent.name
+    metadata = metadata or {}
+    frame_name = str(metadata.get("frame_name") or image.stem)
+    frame_number = _parse_frame_number(frame_name)
+    keyframe_idx = metadata.get("keyframe_idx")
+    if keyframe_idx is None:
+        keyframe_idx = frame_number
+    video_id = str(metadata.get("video_id") or image.parent.name)
+    canonical_frame_id = str(metadata.get("canonical_frame_id") or f"{video_id}_{frame_name}")
+    legacy_frame_id = frame_name
 
     clean_text = (clean_text or "").strip()
     review_text = (review_text or "").strip()
@@ -274,6 +283,7 @@ def build_es_document(
         (line.get("final_text") or line.get("vietocr_text") or "").strip()
         for line in line_items
         if line.get("keep_for_index")
+        and not line.get("need_review")
         and (line.get("final_text") or line.get("vietocr_text") or "").strip()
         and not classify_noise_text((line.get("final_text") or line.get("vietocr_text") or ""), cfg)
     ]
@@ -284,20 +294,41 @@ def build_es_document(
         and group.get("group_text_clean", "").strip()
         and not classify_noise_text(group.get("group_text_clean", ""), cfg)
     ]
-    search_parts = [clean_text, *group_texts, *line_texts]
+    raw_evidence_parts = [clean_text, *group_texts, *line_texts]
+    evidence_parts = _dedupe_text_parts(raw_evidence_parts)
+    search_parts = [clean_text]
     if cfg.get("es_include_review_in_search", False):
         search_parts.append(review_text)
-    search_text = _normalize_space("\n".join(search_parts))
+    search_parts_clean = [part for part in search_parts if _normalize_space(part)]
+    deduped_search_parts = _dedupe_text_parts(search_parts_clean)
+    search_text = _normalize_space("\n".join(deduped_search_parts))
     search_unaccent = _strip_accents(search_text)
     terms = _extract_terms(search_unaccent)
+    review_included = bool(cfg.get("es_include_review_in_search", False))
+    search_duplicate_count = max(0, len(search_parts_clean) - len(deduped_search_parts))
+    evidence_duplicate_count = max(0, len([p for p in raw_evidence_parts if _normalize_space(p)]) - len(evidence_parts))
 
     quality = {
         "lines_detected": len(line_items),
         "groups_formed": len(groups),
         "clean_chars": len(clean_text),
         "review_chars": len(review_text),
+        "has_clean_text": bool(clean_text),
+        "has_review_text": bool(review_text),
         "num_keep_lines": sum(1 for line in line_items if line.get("keep_for_index")),
+        "num_primary_keep_lines": sum(
+            1 for line in line_items
+            if line.get("keep_for_index") and not line.get("need_review")
+        ),
         "num_review_lines": sum(1 for line in line_items if line.get("need_review")),
+        "num_search_lines": len([text for text in line_texts if text]),
+        "num_search_duplicates": search_duplicate_count,
+        "num_evidence_duplicates": evidence_duplicate_count,
+        "review_included_in_search": review_included,
+        "num_need_review_lines_in_primary_search": 0 if not review_included else sum(
+            1 for line in line_items
+            if line.get("need_review") and line.get("keep_for_index")
+        ),
         "num_noise_filtered_lines": sum(1 for line in line_items if line.get("post_filter_status") == "text_noise_filter"),
         "num_vintern_lines": sum(1 for line in line_items if line.get("vintern_text")),
         "num_vlm_candidates": sum(1 for line in line_items if line.get("send_to_vintern")),
@@ -306,17 +337,32 @@ def build_es_document(
     }
 
     doc = {
-        "schema_version": "ocr_vlm_pipeline_v2_es_1",
-        "document_id": f"{video_id}:{frame_id}",
+        "schema_version": SCHEMA_VERSION,
+        "document_id": f"ocr:{canonical_frame_id}",
         "video_id": video_id,
-        "frame_id": frame_id,
+        "frame_id": canonical_frame_id,
+        "canonical_frame_id": canonical_frame_id,
+        "legacy_frame_id": legacy_frame_id,
+        "frame_name": frame_name,
         "frame_number": frame_number,
+        "keyframe_idx": keyframe_idx,
+        "source_frame_idx": metadata.get("source_frame_idx"),
+        "timestamp_sec": metadata.get("timestamp_sec"),
+        "timestamp_source": metadata.get("timestamp_source", "none"),
         "image_path": str(image_path),
+        "image_relpath": metadata.get("image_relpath") or f"{video_id}/{image.name}",
         "media": {
             "video_id": video_id,
-            "frame_id": frame_id,
+            "frame_id": canonical_frame_id,
+            "canonical_frame_id": canonical_frame_id,
+            "legacy_frame_id": legacy_frame_id,
+            "frame_name": frame_name,
             "frame_number": frame_number,
+            "keyframe_idx": keyframe_idx,
+            "source_frame_idx": metadata.get("source_frame_idx"),
+            "timestamp_sec": metadata.get("timestamp_sec"),
             "image_path": str(image_path),
+            "image_relpath": metadata.get("image_relpath") or f"{video_id}/{image.name}",
         },
         "ocr_pipeline": {
             "detector": cfg.get("det_model_name", "PP-OCRv6_medium_det"),
@@ -327,7 +373,7 @@ def build_es_document(
             "fallback_vlm_group": cfg.get("vintern_model_id", "5CD-AI/Vintern-1B-v3_5"),
             "wordlist_enabled": True,
             "group_text_rule": "group_text_clean only; group_text_review is not indexed",
-            "search_text_rule": "ocr_text_search uses clean/indexable text only unless es_include_review_in_search=true",
+            "search_text_rule": "ocr_text_search uses clean_text only unless es_include_review_in_search=true",
         },
         "timing": timing or {},
         "quality": quality,
@@ -336,6 +382,8 @@ def build_es_document(
         "ocr_text_search": search_text,
         "ocr_text_unaccent": search_unaccent,
         "ocr_terms": terms,
+        "ocr_text_evidence": _normalize_space("\n".join(evidence_parts)),
+        "all_ocr_text": _normalize_space("\n".join(_dedupe_text_parts([clean_text, review_text]))),
         "ocr_group_texts_clean": [g.get("group_text_clean", "") for g in groups],
         "ocr_group_texts_review": [g.get("group_text_review", "") for g in groups],
         "ocr_lines": _serialize_lines(line_items),
@@ -412,6 +460,21 @@ def _parse_frame_number(frame_id: str) -> int | None:
 
 def _normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _dedupe_text_parts(parts: list[str]) -> list[str]:
+    out = []
+    seen = set()
+    for part in parts:
+        clean = _normalize_space(part)
+        if not clean:
+            continue
+        key = _strip_accents(clean)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(clean)
+    return out
 
 
 def _strip_accents(text: str) -> str:

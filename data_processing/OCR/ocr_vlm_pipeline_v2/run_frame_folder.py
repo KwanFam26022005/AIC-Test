@@ -20,6 +20,7 @@ import shutil
 import sys
 import time
 import warnings
+from collections import Counter
 from pathlib import Path
 from statistics import mean
 
@@ -28,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ocr_pipeline.config import make_config
 from ocr_pipeline.detector import create_detector
-from ocr_pipeline.outputs import build_es_document
+from ocr_pipeline.outputs import SCHEMA_VERSION, build_es_document
 from ocr_pipeline.recognizers.vietocr_recognizer import create_vietocr_predictor
 from ocr_pipeline.scoring.wordlist import load_wordlist
 from run_single_frame import run_ocr_pipeline
@@ -61,6 +62,155 @@ def collect_frames(frames_dir: Path, pattern: str, limit: int | None = None) -> 
     if limit is not None:
         frames = frames[:limit]
     return frames
+
+
+def parse_frame_number(frame_name: str) -> int | None:
+    try:
+        return int(frame_name)
+    except ValueError:
+        digits = ""
+        for char in reversed(frame_name):
+            if char.isdigit():
+                digits = char + digits
+            elif digits:
+                break
+        return int(digits) if digits else None
+
+
+def load_keyframe_map_csv(csv_path: str | Path) -> dict[int, dict]:
+    path = Path(csv_path)
+    if not path.is_file():
+        logger.warning("Keyframe map CSV not found: %s", path)
+        return {}
+
+    result: dict[int, dict] = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                keyframe_idx = int(row["n"])
+                result[keyframe_idx] = {
+                    "pts_time": float(row["pts_time"]),
+                    "fps": float(row.get("fps", 0) or 0),
+                    "frame_idx": int(float(row.get("frame_idx", 0) or 0)),
+                }
+            except (KeyError, ValueError) as exc:
+                logger.warning("Skipping malformed keyframe map row: %s (%s)", row, exc)
+    logger.info("Loaded keyframe map: %d entries from %s", len(result), path)
+    return result
+
+
+def find_keyframe_map_for_video(keyframe_map_path: str | Path | None, video_id: str) -> dict[int, dict]:
+    if not keyframe_map_path:
+        return {}
+
+    path = Path(keyframe_map_path)
+    if path.is_file():
+        return load_keyframe_map_csv(path)
+    if path.is_dir():
+        for candidate in (path / video_id / f"{video_id}.csv", path / f"{video_id}.csv"):
+            if candidate.is_file():
+                return load_keyframe_map_csv(candidate)
+
+    logger.warning("No keyframe map found for video_id=%s at %s", video_id, keyframe_map_path)
+    return {}
+
+
+def iter_jsonl(path: str | Path):
+    with open(path, "r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                doc = json.loads(line)
+            except json.JSONDecodeError as exc:
+                logger.warning("Skipping corrupt JSONL line %s:%d: %s", path, line_no, exc)
+                continue
+            if isinstance(doc, dict):
+                yield doc
+
+
+def load_video_manifest(manifest_path: str | Path | None) -> dict[str, dict]:
+    if not manifest_path:
+        return {}
+    path = Path(manifest_path)
+    if not path.is_file():
+        logger.warning("Video manifest not found: %s", path)
+        return {}
+
+    result: dict[str, dict] = {}
+    for doc in iter_jsonl(path):
+        video_id = doc.get("video_id")
+        if video_id:
+            result[str(video_id)] = doc
+    logger.info("Loaded video manifest: %d entries from %s", len(result), path)
+    return result
+
+
+def resolve_timestamp(
+    keyframe_idx: int | None,
+    keyframe_map: dict[int, dict],
+    num_keyframes: int,
+    manifest_doc: dict | None,
+    strategy: str,
+) -> tuple[float | None, str]:
+    if strategy == "none":
+        return None, "none"
+    if keyframe_idx is None:
+        return None, "missing_keyframe_idx"
+
+    if strategy in ("map_or_uniform", "map_only") and keyframe_idx in keyframe_map:
+        return float(keyframe_map[keyframe_idx]["pts_time"]), "keyframe_map_csv"
+    if strategy == "map_only":
+        return None, "map_missing"
+
+    if strategy in ("map_or_uniform", "uniform") and manifest_doc and num_keyframes > 1:
+        duration = manifest_doc.get("duration_sec")
+        if duration and float(duration) > 0:
+            value = (keyframe_idx - 1) * float(duration) / max(1, num_keyframes - 1)
+            return round(value, 6), "uniform_interpolation"
+
+    return None, "unavailable"
+
+
+def build_frame_metadata(
+    frame_path: Path,
+    video_id: str,
+    frames_root: str | Path | None,
+    keyframe_map: dict[int, dict],
+    num_keyframes: int,
+    manifest_doc: dict | None,
+    timestamp_strategy: str,
+) -> dict:
+    frame_name = frame_path.stem
+    keyframe_idx = parse_frame_number(frame_name)
+    timestamp_sec, timestamp_source = resolve_timestamp(
+        keyframe_idx,
+        keyframe_map,
+        num_keyframes,
+        manifest_doc,
+        timestamp_strategy,
+    )
+    map_row = keyframe_map.get(keyframe_idx) if keyframe_idx is not None else None
+    image_relpath = f"{video_id}/{frame_path.name}"
+    if frames_root:
+        try:
+            image_relpath = str(frame_path.resolve().relative_to(Path(frames_root).resolve())).replace("\\", "/")
+        except ValueError:
+            image_relpath = f"{video_id}/{frame_path.name}"
+
+    canonical_frame_id = f"{video_id}_{frame_name}"
+    return {
+        "video_id": video_id,
+        "frame_name": frame_name,
+        "canonical_frame_id": canonical_frame_id,
+        "keyframe_idx": keyframe_idx,
+        "source_frame_idx": map_row.get("frame_idx") if map_row else None,
+        "timestamp_sec": timestamp_sec,
+        "timestamp_source": timestamp_source,
+        "image_relpath": image_relpath,
+    }
 
 
 def build_context(cfg: dict, use_vintern: bool) -> tuple[dict, dict]:
@@ -102,6 +252,14 @@ def append_jsonl(path: Path, doc: dict) -> None:
         f.write("\n")
 
 
+def write_jsonl_docs(path: Path, docs: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        for doc in docs:
+            handle.write(json.dumps(doc, ensure_ascii=False))
+            handle.write("\n")
+
+
 def write_summary_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = sorted({key for row in rows for key in row.keys()})
@@ -127,6 +285,62 @@ def timing_stats(rows: list[dict]) -> dict:
             "max": round(max(values), 3),
         }
     return stats
+
+
+def build_quality_summary(docs: list[dict], rows: list[dict]) -> dict:
+    top_terms: Counter[str] = Counter()
+    missing_timestamp = 0
+    missing_canonical = 0
+    search_duplicates = 0
+    review_in_primary = 0
+    frames_with_clean = 0
+    frames_with_review = 0
+    total_clean_chars = 0
+    total_review_chars = 0
+    out_of_order = 0
+    previous_idx: int | None = None
+
+    for doc in docs:
+        keyframe_idx = doc.get("keyframe_idx")
+        if isinstance(keyframe_idx, int):
+            if previous_idx is not None and keyframe_idx < previous_idx:
+                out_of_order += 1
+            previous_idx = keyframe_idx
+
+        if doc.get("timestamp_sec") is None:
+            missing_timestamp += 1
+        if not doc.get("canonical_frame_id"):
+            missing_canonical += 1
+
+        clean_text = doc.get("ocr_text_clean") or ""
+        review_text = doc.get("ocr_text_review") or ""
+        if clean_text.strip():
+            frames_with_clean += 1
+        if review_text.strip():
+            frames_with_review += 1
+        total_clean_chars += len(clean_text)
+        total_review_chars += len(review_text)
+
+        quality = doc.get("quality") or {}
+        search_duplicates += int(quality.get("num_search_duplicates") or 0)
+        review_in_primary += int(quality.get("num_need_review_lines_in_primary_search") or 0)
+        top_terms.update(str(term) for term in (doc.get("ocr_terms") or []))
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "num_frames": len(docs),
+        "num_rows": len(rows),
+        "num_frames_missing_timestamp": missing_timestamp,
+        "num_frames_missing_canonical_frame_id": missing_canonical,
+        "num_docs_out_of_order": out_of_order,
+        "num_search_duplicates": search_duplicates,
+        "num_need_review_lines_in_primary_search": review_in_primary,
+        "num_frames_with_clean_text": frames_with_clean,
+        "num_frames_with_review_text": frames_with_review,
+        "total_clean_chars": total_clean_chars,
+        "total_review_chars": total_review_chars,
+        "top_ocr_terms": dict(top_terms.most_common(30)),
+    }
 
 
 def format_eta(done: int, total: int, elapsed: float) -> str:
@@ -233,6 +447,7 @@ def process_frame(
     cfg: dict,
     context: dict,
     video_id: str,
+    frame_metadata: dict,
     cleanup_crops: bool,
 ) -> tuple[dict, dict, float]:
     """Run OCR for one frame and return ES doc, summary row, and wall time."""
@@ -253,9 +468,8 @@ def process_frame(
         frame_cfg,
         str(frame_path),
         result["timing"],
+        metadata=frame_metadata,
     )
-    doc["video_id"] = video_id
-    doc["document_id"] = f"{video_id}:{result['frame_id']}"
     doc["batch_output_paths"] = result.get("output_paths", {})
 
     if cleanup_crops:
@@ -265,9 +479,17 @@ def process_frame(
     timing = result.get("timing", {})
     row = {
         "video_id": video_id,
-        "frame_id": result["frame_id"],
+        "frame_id": doc.get("frame_id"),
+        "canonical_frame_id": doc.get("canonical_frame_id"),
+        "legacy_frame_id": doc.get("legacy_frame_id"),
+        "frame_name": doc.get("frame_name"),
         "frame_number": doc.get("frame_number"),
+        "keyframe_idx": doc.get("keyframe_idx"),
+        "source_frame_idx": doc.get("source_frame_idx"),
+        "timestamp_sec": doc.get("timestamp_sec"),
+        "timestamp_source": doc.get("timestamp_source"),
         "image_path": str(frame_path),
+        "image_relpath": doc.get("image_relpath"),
         "lines_detected": len(result["line_items"]),
         "groups_formed": len(result["groups"]),
         "clean_chars": len(result["final_clean_text"]),
@@ -304,6 +526,7 @@ def process_frame_parallel(payload: dict) -> tuple[dict, dict, float]:
         cfg=cfg,
         context=context,
         video_id=payload["video_id"],
+        frame_metadata=payload["frame_metadata"],
         cleanup_crops=payload["cleanup_crops"],
     )
 
@@ -315,6 +538,16 @@ def main() -> None:
     parser.add_argument("--video_id", default=None, help="Video id; defaults to frames folder name")
     parser.add_argument("--pattern", default="*", help="Frame glob pattern, e.g. '*.jpg'")
     parser.add_argument("--limit", type=int, default=None, help="Only run first N frames")
+    parser.add_argument("--keyframe_map", "--keyframe-map", default=None, help="Keyframe map CSV, or root containing <video_id>/<video_id>.csv")
+    parser.add_argument("--video_manifest", "--video-manifest", default=None, help="Optional video_manifest.jsonl for timestamp fallback")
+    parser.add_argument("--frames_root", "--frames-root", default=None, help="Root of keyframe folders for image_relpath")
+    parser.add_argument(
+        "--timestamp_strategy",
+        "--timestamp-strategy",
+        choices=("map_or_uniform", "map_only", "uniform", "none"),
+        default="map_or_uniform",
+        help="How to assign timestamp_sec for each frame",
+    )
     parser.add_argument("--no_vintern", action="store_true", help="Disable Vintern fallback")
     parser.add_argument("--vietocr_batch_size", type=int, default=None, help="Override VietOCR CNN batch size")
     parser.add_argument("--vietocr_batch", action="store_true", help="Enable experimental VietOCR batch decoder")
@@ -358,13 +591,30 @@ def main() -> None:
     es_jsonl_path = output_root / f"{video_id}_ocr_es_docs.jsonl"
     summary_csv_path = output_root / f"{video_id}_ocr_frame_summary.csv"
     summary_json_path = output_root / f"{video_id}_ocr_timing_summary.json"
+    quality_summary_path = output_root / f"{video_id}_ocr_quality_summary.json"
 
     frames = collect_frames(frames_dir, args.pattern, args.limit)
     if not frames:
         raise FileNotFoundError(f"No frames found in {frames_dir} with pattern={args.pattern!r}")
 
+    frames_root = args.frames_root or str(frames_dir.parent)
+    keyframe_map = find_keyframe_map_for_video(args.keyframe_map, video_id)
+    video_manifest = load_video_manifest(args.video_manifest)
+    manifest_doc = video_manifest.get(video_id)
+    frame_metadata_by_path = {
+        str(frame_path): build_frame_metadata(
+            frame_path=frame_path,
+            video_id=video_id,
+            frames_root=frames_root,
+            keyframe_map=keyframe_map,
+            num_keyframes=len(frames),
+            manifest_doc=manifest_doc,
+            timestamp_strategy=args.timestamp_strategy,
+        )
+        for frame_path in frames
+    }
+
     output_root.mkdir(parents=True, exist_ok=True)
-    es_jsonl_path.write_text("", encoding="utf-8")
 
     cfg = make_config(output_dir=str(output_root))
     apply_artifact_mode(cfg, args.batch_artifacts)
@@ -388,6 +638,9 @@ def main() -> None:
     logger.info("Video id: %s", video_id)
     logger.info("Frames: %d from %s", len(frames), frames_dir)
     logger.info("Output root: %s", output_root)
+    logger.info("Schema: %s", SCHEMA_VERSION)
+    logger.info("Keyframe map entries: %d", len(keyframe_map))
+    logger.info("Timestamp strategy: %s", args.timestamp_strategy)
     logger.info("Vintern enabled: %s", use_vintern)
     logger.info(
         "Batch settings: artifacts=%s cleanup_crops=%s vietocr_use_batch=%s "
@@ -405,6 +658,7 @@ def main() -> None:
 
     batch_start = time.time()
     rows: list[dict] = []
+    docs: list[dict] = []
     init_timing: dict = {}
     progress_enabled = not args.no_progress
     progress_bar = None
@@ -428,9 +682,10 @@ def main() -> None:
                 cfg=cfg,
                 context=context,
                 video_id=video_id,
+                frame_metadata=frame_metadata_by_path[str(frame_path)],
                 cleanup_crops=args.cleanup_crops,
             )
-            append_jsonl(es_jsonl_path, doc)
+            docs.append(doc)
             rows.append(row)
 
             elapsed = time.time() - batch_start
@@ -466,6 +721,7 @@ def main() -> None:
                 "frame_path": str(frame_path),
                 "frame_output_dir": str(per_frame_root / frame_path.stem),
                 "video_id": video_id,
+                "frame_metadata": frame_metadata_by_path[str(frame_path)],
                 "cleanup_crops": args.cleanup_crops,
             }
             for idx, frame_path in enumerate(frames, start=1)
@@ -485,7 +741,7 @@ def main() -> None:
             for future in concurrent.futures.as_completed(future_to_payload):
                 payload = future_to_payload[future]
                 doc, row, frame_elapsed = future.result()
-                append_jsonl(es_jsonl_path, doc)
+                docs.append(doc)
                 rows.append(row)
                 completed += 1
 
@@ -516,19 +772,31 @@ def main() -> None:
 
     total_elapsed = time.time() - batch_start
     rows.sort(key=lambda row: (row.get("batch_index", 10**18), str(row.get("frame_id", ""))))
+    docs.sort(key=lambda doc: (
+        doc.get("keyframe_idx") if doc.get("keyframe_idx") is not None else 10**18,
+        str(doc.get("frame_name", "")),
+    ))
+    write_jsonl_docs(es_jsonl_path, docs)
     write_summary_csv(summary_csv_path, rows)
+    quality_summary = build_quality_summary(docs, rows)
     summary = {
+        "schema_version": SCHEMA_VERSION,
         "video_id": video_id,
         "frames_dir": str(frames_dir),
         "num_frames": len(frames),
         "output_root": str(output_root),
         "es_jsonl_path": str(es_jsonl_path),
         "summary_csv_path": str(summary_csv_path),
+        "quality_summary_path": str(quality_summary_path),
+        "keyframe_map_entries": len(keyframe_map),
+        "timestamp_strategy": args.timestamp_strategy,
         "init_timing": init_timing,
         "total_wall_time_sec": round(total_elapsed, 3),
         "avg_wall_time_sec_per_frame": round(total_elapsed / len(frames), 3),
         "timing_stats": timing_stats(rows),
+        "quality_summary": quality_summary,
     }
+    quality_summary_path.write_text(json.dumps(quality_summary, ensure_ascii=False, indent=2), encoding="utf-8")
     summary_json_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("\n" + "=" * 72)
@@ -541,6 +809,7 @@ def main() -> None:
     print(f"ES JSONL: {es_jsonl_path}")
     print(f"Summary CSV: {summary_csv_path}")
     print(f"Timing JSON: {summary_json_path}")
+    print(f"Quality JSON: {quality_summary_path}")
 
 
 if __name__ == "__main__":

@@ -415,6 +415,21 @@ def canonical_count_label(label: str) -> str:
     return COUNT_CANONICAL_MAP.get(label, label)
 
 
+def canonicalize_family_detection(det):
+    """Canonicalize one person-family detection while preserving raw_label."""
+    det_copy = dict(det)
+    raw_label = det_copy.get("label", "")
+    canonical = canonical_count_label(raw_label)
+    if canonical != raw_label:
+        det_copy["raw_label"] = raw_label
+        det_copy["label"] = canonical
+        attributes = list(det_copy.get("attributes") or [])
+        if raw_label.lower() not in [str(a).lower() for a in attributes]:
+            attributes.append(raw_label.lower())
+        det_copy["attributes"] = attributes
+    return det_copy
+
+
 def family_aware_nms(detections, iou_threshold=0.5, containment_threshold=0.7):
     """Loại bbox trùng trong cùng person-family hierarchy.
 
@@ -444,7 +459,7 @@ def family_aware_nms(detections, iou_threshold=0.5, containment_threshold=0.7):
             non_family_dets.append(det)
 
     if len(family_dets) <= 1:
-        return detections
+        return non_family_dets + [canonicalize_family_detection(det) for det in family_dets]
 
     # Sort by score descending
     family_dets.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)
@@ -471,15 +486,7 @@ def family_aware_nms(detections, iou_threshold=0.5, containment_threshold=0.7):
 
         if not is_duplicate:
             # Gán canonical label cho counting
-            det_copy = dict(det)
-            raw_label = det_copy.get("label", "")
-            canonical = canonical_count_label(raw_label)
-            if canonical != raw_label:
-                det_copy["raw_label"] = raw_label
-                det_copy["label"] = canonical
-                if "attributes" not in det_copy:
-                    det_copy["attributes"] = [raw_label.lower()]
-            kept_family.append(det_copy)
+            kept_family.append(canonicalize_family_detection(det))
 
     return non_family_dets + kept_family
 

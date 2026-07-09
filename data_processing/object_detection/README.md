@@ -72,6 +72,10 @@ GroundingDINO:
 Postprocess:
   nms_iou_threshold: 0.70
   scene_area_threshold: 0.60
+
+Metadata:
+  timestamp_strategy: map_or_uniform
+  keyframe_map: pass by CLI for each dataset root
 ```
 
 ## Smoke Test
@@ -87,6 +91,9 @@ Override sample size:
 LIMIT=100 bash scripts/run_l22_v012_smoke.sh
 ```
 
+The smoke script passes `keyframe_test` as the keyframe map root, so
+`keyframe_test/L22_V012/L22_V012.csv` is used for `timestamp_sec`.
+
 Visualize smoke-test detections:
 
 ```bash
@@ -94,6 +101,7 @@ python visualize_detections.py \
   --jsonl ./outputs/object_detection/L22_V012_objects.jsonl \
   --output-dir ./outputs/object_detection/visualized \
   --frames-dir ./keyframe_test/L22_V012 \
+  --frames-root ./keyframe_test \
   --limit 20 \
   --tag-field object_prompt_tags \
   --save-tag-files
@@ -116,8 +124,24 @@ python ram_gdino_pipeline.py \
   --output ./outputs/object_detection \
   --batch \
   --resume \
+  --keyframe-map ./keyframe_test \
+  --frames-root ./keyframe_test \
   --summary-output ./outputs/object_detection/summaries/L22_summary.json
 ```
 
 If A5000 VRAM is tight, try `--ram-batch-size 8` or `--image-max-side 960`.
 If small objects are missed, benchmark `--image-max-side 1536` on a sample first.
+
+## Enrich Legacy JSONL
+
+Use this when old object output needs caption/search fields but rerunning GPU is
+not practical:
+
+```bash
+python enrich_object_detection_jsonl.py \
+  --input ./outputs/object_detection/L22_V012_objects.jsonl \
+  --output ./outputs/object_detection/L22_V012_objects_enriched.jsonl \
+  --summary-output ./outputs/object_detection/summaries/L22_V012_enriched_summary.json \
+  --video-id L22_V012 \
+  --keyframe-map ./keyframe_test
+```

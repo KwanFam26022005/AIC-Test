@@ -1,12 +1,13 @@
 pipeline:
   name: ram_plus_groundingdino_object_detection
   version: "0.2.0"
-  schema_version: ram_gdino_object_detection_v1
+  schema_version: ram_gdino_object_detection_v1_1
 
 io:
   pattern: "*.jpg"
   batch: false
   resume: true
+  resume_legacy: true
   flush_every: 1
 
 runtime:
@@ -30,3 +31,9 @@ grounding_dino:
 postprocess:
   nms_iou_threshold: 0.70
   scene_area_threshold: 0.60
+
+metadata:
+  video_manifest:
+  keyframe_map:
+  frames_root:
+  timestamp_strategy: map_or_uniform

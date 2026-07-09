@@ -182,7 +182,20 @@ def build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     resume_group = parser.add_mutually_exclusive_group()
     resume_group.add_argument("--resume", dest="resume", action="store_true", default=defaults["resume"], help="Skip frame_ids already present in output JSONL.")
     resume_group.add_argument("--no-resume", dest="resume", action="store_false", help="Overwrite outputs instead of resuming.")
-    parser.add_argument("--resume-legacy", dest="resume_legacy", action="store_true", default=defaults["resume_legacy"], help="When resuming, skip frames without fingerprint match (legacy behavior).")
+    legacy_resume_group = parser.add_mutually_exclusive_group()
+    legacy_resume_group.add_argument(
+        "--resume-legacy",
+        dest="resume_legacy",
+        action="store_true",
+        default=defaults["resume_legacy"],
+        help="When resuming, skip existing legacy records that do not have frame_fingerprint.",
+    )
+    legacy_resume_group.add_argument(
+        "--no-resume-legacy",
+        dest="resume_legacy",
+        action="store_false",
+        help="When resuming, rerun existing legacy records that do not have frame_fingerprint.",
+    )
 
     parser.add_argument("--pattern", default=defaults["pattern"], help="Glob pattern for frames inside each video directory.")
     parser.add_argument("--limit", type=int, default=defaults["limit"], help="Limit frames per video.")
@@ -1052,12 +1065,19 @@ def run_single_video(
     skipped = 0
     errors = 0
     total_objects = 0
+    frames_missing_timestamp = 0
+    objects_missing_area_ratio = 0
+    objects_missing_position = 0
+    scene_labels_in_counts = 0
+    top_object_counts: Counter[str] = Counter()
     record_counter = 0
     start_time = time.time()
     pending: list[Path] = []
 
     def flush_pending(handle) -> None:
         nonlocal pending, processed, errors, total_objects, record_counter
+        nonlocal frames_missing_timestamp, objects_missing_area_ratio
+        nonlocal objects_missing_position, scene_labels_in_counts, top_object_counts
         if not pending:
             return
         try:
@@ -1089,7 +1109,26 @@ def run_single_video(
             flush_now = args.flush_every == 1 or record_counter % args.flush_every == 0
             write_jsonl_record(handle, doc, flush=flush_now)
             processed += 1
-            total_objects += len(doc["objects"])
+            objects = doc["objects"]
+            total_objects += len(objects)
+
+            if doc.get("timestamp_sec") is None:
+                frames_missing_timestamp += 1
+
+            for obj in objects:
+                if obj.get("area_ratio") is None:
+                    objects_missing_area_ratio += 1
+                if not obj.get("position"):
+                    objects_missing_position += 1
+
+            scene_tag_set = set(doc.get("scene_tags") or [])
+            counts_normalized = doc.get("object_counts_normalized") or {}
+            for label, count in counts_normalized.items():
+                label_str = str(label)
+                count_int = int(count or 0)
+                top_object_counts[label_str] += count_int
+                if label_str in scene_tag_set:
+                    scene_labels_in_counts += count_int
         pending = []
 
     with open(output_path, write_mode, encoding="utf-8") as out_handle:
@@ -1131,6 +1170,12 @@ def run_single_video(
         "skipped": skipped,
         "errors": errors,
         "total_objects": total_objects,
+        "num_frames_missing_timestamp": frames_missing_timestamp,
+        "num_objects_missing_area_ratio": objects_missing_area_ratio,
+        "num_objects_missing_position": objects_missing_position,
+        "num_scene_labels_in_counts": scene_labels_in_counts,
+        "num_unresolved_image_paths": 0,
+        "top_object_counts": dict(top_object_counts.most_common(20)),
         "elapsed_sec": round(elapsed, 3),
         "fps": round(processed / elapsed, 4) if elapsed > 0 else None,
         "run_config_hash": run_config_hash,
@@ -1215,12 +1260,29 @@ def write_summary(summary_path: str | Path, summaries: list[dict[str, Any]], arg
             "text_threshold": args.text_threshold,
             "nms_iou_threshold": args.nms_iou_threshold,
             "scene_area_threshold": args.scene_area_threshold,
+            "timestamp_strategy": getattr(args, "timestamp_strategy", None),
+            "keyframe_map": getattr(args, "keyframe_map", None),
+            "video_manifest": getattr(args, "video_manifest", None),
+            "frames_root": getattr(args, "frames_root", None),
+            "resume_legacy": getattr(args, "resume_legacy", None),
             "amp": args.amp,
             "allow_tf32": args.allow_tf32,
         },
         "runs": summaries,
         "total_processed": sum(int(item.get("processed") or 0) for item in summaries),
         "total_errors": sum(int(item.get("errors") or 0) for item in summaries),
+        "total_frames_missing_timestamp": sum(
+            int(item.get("num_frames_missing_timestamp") or 0) for item in summaries
+        ),
+        "total_objects_missing_area_ratio": sum(
+            int(item.get("num_objects_missing_area_ratio") or 0) for item in summaries
+        ),
+        "total_objects_missing_position": sum(
+            int(item.get("num_objects_missing_position") or 0) for item in summaries
+        ),
+        "total_scene_labels_in_counts": sum(
+            int(item.get("num_scene_labels_in_counts") or 0) for item in summaries
+        ),
     }
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
