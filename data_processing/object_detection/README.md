@@ -94,7 +94,9 @@ python visualize_detections.py \
   --jsonl ./outputs/object_detection/L22_V012_objects.jsonl \
   --output-dir ./outputs/object_detection/visualized \
   --frames-dir ./keyframe_test/L22_V012 \
-  --limit 20
+  --limit 20 \
+  --tag-field object_prompt_tags \
+  --save-tag-files
 ```
 
 ## Batch Run

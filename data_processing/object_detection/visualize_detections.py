@@ -123,7 +123,92 @@ def draw_label(
     draw.text((x + 4, y0 + 3), text, fill=(255, 255, 255), font=font)
 
 
-def draw_detections(doc: dict[str, Any], image_path: Path, output_path: Path) -> int:
+def wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+        if bbox[2] - bbox[0] <= max_width or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+    return lines
+
+
+def build_tag_panel_text(doc: dict[str, Any], tag_field: str) -> list[str]:
+    prompt_tags = [str(tag) for tag in (doc.get(tag_field) or []) if str(tag).strip()]
+    raw_tags = [str(tag) for tag in (doc.get("raw_tags") or doc.get("tags") or []) if str(tag).strip()]
+    object_counts = doc.get("object_counts") or {}
+
+    lines = [
+        f"Frame: {doc.get('frame_id', '')}",
+        f"{tag_field}: {', '.join(prompt_tags) if prompt_tags else '(none)'}",
+    ]
+    if raw_tags:
+        lines.append(f"raw/tags: {', '.join(raw_tags)}")
+    if object_counts:
+        summary = ", ".join(f"{key}:{value}" for key, value in sorted(object_counts.items()))
+        lines.append(f"counts: {summary}")
+    return lines
+
+
+def add_tag_panel(
+    image: Image.Image,
+    doc: dict[str, Any],
+    tag_field: str,
+    font,
+) -> Image.Image:
+    width, height = image.size
+    probe = Image.new("RGB", (width, 1), (255, 255, 255))
+    probe_draw = ImageDraw.Draw(probe)
+
+    max_text_width = max(200, width - 24)
+    raw_lines = build_tag_panel_text(doc, tag_field)
+    lines: list[str] = []
+    for raw_line in raw_lines:
+        lines.extend(wrap_text(probe_draw, raw_line, font, max_text_width))
+
+    line_heights = []
+    for line in lines:
+        bbox = probe_draw.textbbox((0, 0), line, font=font)
+        line_heights.append(max(14, bbox[3] - bbox[1]))
+
+    panel_height = max(44, sum(line_heights) + 18 + max(0, len(lines) - 1) * 4)
+    canvas = Image.new("RGB", (width, height + panel_height), (245, 247, 250))
+    canvas.paste(image, (0, 0))
+
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle([0, height, width, height + panel_height], fill=(245, 247, 250))
+    draw.line([0, height, width, height], fill=(40, 40, 40), width=2)
+
+    y = height + 9
+    for line, line_height in zip(lines, line_heights):
+        draw.text((12, y), line, fill=(20, 20, 20), font=font)
+        y += line_height + 4
+    return canvas
+
+
+def write_tag_file(doc: dict[str, Any], output_path: Path, tag_field: str) -> None:
+    tag_path = output_path.with_suffix(".tags.txt")
+    lines = build_tag_panel_text(doc, tag_field)
+    tag_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def draw_detections(
+    doc: dict[str, Any],
+    image_path: Path,
+    output_path: Path,
+    tag_field: str,
+    show_tags: bool,
+    save_tag_files: bool,
+) -> int:
     image = Image.open(image_path).convert("RGB")
     draw = ImageDraw.Draw(image)
     font = get_font()
@@ -155,8 +240,13 @@ def draw_detections(doc: dict[str, Any], image_path: Path, output_path: Path) ->
         header = f"{header} | {summary}"
     draw_label(draw, (8, 8), header, (20, 20, 20), font)
 
+    if show_tags:
+        image = add_tag_panel(image, doc, tag_field, font)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path, quality=95)
+    if save_tag_files:
+        write_tag_file(doc, output_path, tag_field)
     return drawn
 
 
@@ -177,6 +267,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frames-root", default=None, help="Fallback parent directory containing video_id subdirs.")
     parser.add_argument("--limit", type=int, default=50, help="Max records to visualize.")
     parser.add_argument("--only-with-objects", action="store_true", help="Skip frames with no final objects.")
+    parser.add_argument("--tag-field", default="object_prompt_tags", help="JSON field to display as the used tags panel.")
+    parser.add_argument("--hide-tags", action="store_true", help="Do not draw the used-tags panel under the image.")
+    parser.add_argument("--save-tag-files", action="store_true", help="Write a .tags.txt file next to each annotated image.")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging.")
     return parser.parse_args()
 
@@ -207,7 +300,14 @@ def main() -> None:
             continue
 
         out_path = build_output_path(doc, image_path, output_dir)
-        num_boxes = draw_detections(doc, image_path, out_path)
+        num_boxes = draw_detections(
+            doc,
+            image_path,
+            out_path,
+            tag_field=args.tag_field,
+            show_tags=not args.hide_tags,
+            save_tag_files=args.save_tag_files,
+        )
         LOG.info("Wrote %s (%d boxes)", out_path, num_boxes)
         seen += 1
         written += 1
