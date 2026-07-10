@@ -297,15 +297,29 @@ class Qwen25VLCaptioner:
         self.generation = generation
         model_name = model_cfg["model_name"]
         dtype = _torch_dtype(torch, model_cfg.get("dtype", "bfloat16"))
-        model_kwargs: dict[str, Any] = {
-            "torch_dtype": dtype,
-            "device_map": model_cfg.get("device_map", "auto"),
-        }
-        if model_cfg.get("attn_implementation"):
-            model_kwargs["attn_implementation"] = model_cfg["attn_implementation"]
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_name, **model_kwargs,
-        )
+        requested_attn = os.environ.get("CAPTION_VLM_ATTN") or model_cfg.get("attn_implementation")
+        fallback_order = _attention_fallback_order(requested_attn)
+        last_error = None
+        self.model = None
+        for candidate in fallback_order:
+            model_kwargs: dict[str, Any] = {
+                "torch_dtype": dtype,
+                "device_map": model_cfg.get("device_map", "auto"),
+            }
+            if candidate:
+                model_kwargs["attn_implementation"] = candidate
+            logger.info("Loading Qwen2.5-VL: %s, attn=%s", model_name, candidate or "default")
+            try:
+                self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    model_name, **model_kwargs,
+                )
+                logger.info("Qwen2.5-VL loaded successfully: %s, attn=%s", model_name, candidate or "default")
+                break
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Qwen2.5-VL load failed with attn=%s: %s", candidate or "default", exc)
+        if self.model is None:
+            raise RuntimeError(f"Could not load Qwen2.5-VL model {model_name}") from last_error
         self.processor = AutoProcessor.from_pretrained(model_name)
         self.prompt = generation.get("prompt", DEFAULT_PROMPT)
 
@@ -405,6 +419,49 @@ class InternVLCaptioner:
         ).strip()
 
 
+
+def _has_flash_attn() -> bool:
+    try:
+        import flash_attn  # noqa: F401
+        import flash_attn.flash_attn_interface  # noqa: F401
+        return True
+    except Exception as exc:
+        logger.warning("flash_attn is unavailable or ABI-incompatible: %s", exc)
+        return False
+
+
+def _has_sdpa() -> bool:
+    try:
+        import torch.nn.functional as F
+        return hasattr(F, "scaled_dot_product_attention")
+    except Exception:
+        return False
+
+
+def _attention_fallback_order(requested: str | None) -> list[str]:
+    requested = (requested or "").strip()
+    if requested in {"", "auto", "none", "None"}:
+        if _has_flash_attn():
+            requested = "flash_attention_2"
+        elif _has_sdpa():
+            requested = "sdpa"
+        else:
+            requested = "eager"
+    order: list[str] = []
+    if requested == "flash_attention_2" and not _has_flash_attn():
+        logger.warning("Requested flash_attention_2 but flash_attn is not usable; falling back.")
+    elif requested:
+        order.append(requested)
+    for candidate in ("sdpa", "eager"):
+        if candidate not in order:
+            if candidate == "sdpa" and not _has_sdpa():
+                continue
+            order.append(candidate)
+    if not order:
+        order.append("eager")
+    return order
+
+
 def _torch_dtype(torch_module, name: str):
     if name == "float16":
         return torch_module.float16
@@ -433,6 +490,8 @@ def _expand_env(value):
     if isinstance(value, str):
         return os.path.expandvars(value)
     return value
+
+
 
 
 

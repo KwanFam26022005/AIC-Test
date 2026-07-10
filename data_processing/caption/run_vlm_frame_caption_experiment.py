@@ -23,8 +23,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", required=True, help="YAML experiment config")
     parser.add_argument(
         "--env-file",
-        default="",
-        help="Optional .env file loaded before expanding YAML env vars",
+        action="append",
+        default=[],
+        help="Optional .env file loaded before expanding YAML env vars. Can be repeated.",
+    )
+    parser.add_argument(
+        "--env-override",
+        action="store_true",
+        help="Allow later --env-file values to override existing environment variables",
     )
     parser.add_argument("--video-id", default="", help="Override experiment.video_id")
     parser.add_argument("--experiment-name", default="", help="Override experiment.name")
@@ -46,8 +52,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    if args.env_file:
-        load_env_file(args.env_file)
+    for env_file in args.env_file:
+        load_env_file(env_file, override=args.env_override)
     cfg = load_vlm_experiment_config(args.config)
     _apply_overrides(cfg, args)
     report = run_vlm_frame_experiment(cfg)
@@ -84,5 +90,7 @@ def _apply_overrides(cfg: dict, args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
 
 

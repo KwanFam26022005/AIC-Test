@@ -1,0 +1,26 @@
+name: aic-caption-vlm
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip>=24
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - pillow
+  - pyyaml
+  - numpy
+  - tqdm
+  - pip:
+      - "transformers>=4.49.0"
+      - "accelerate>=0.33.0"
+      - "safetensors>=0.4.5"
+      - "qwen-vl-utils>=0.0.8"
+      - "sentencepiece>=0.2.0"
+      - "protobuf>=4.25.0"
+      - "einops>=0.8.0"
+
