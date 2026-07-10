@@ -31,7 +31,7 @@ ROUTE_UNIT_BONUS = {
     "general": {},
 }
 
-SCORING_PROFILES = {"default", "route_aware"}
+SCORING_PROFILES = {"default", "route_aware", "rrf"}
 
 ROUTE_AWARE_FIELD_MULTIPLIER = {
     "ocr": {
@@ -105,6 +105,106 @@ ROUTE_AWARE_ROUTE_STOP_TERMS = {
     "general": {"frame", "frames", "representative", "scene", "show", "shows"},
 }
 
+RRF_K = 60
+RRF_CHANNEL_DEPTH = 100
+
+RRF_CHANNELS = {
+    "visual": {
+        "fields": (
+            "caption_text",
+            "temporal_caption",
+            "object_text",
+            "scene_text",
+            "current_observation",
+            "scene",
+        ),
+        "field_weights": {
+            "caption_text": 1.4,
+            "temporal_caption": 1.1,
+            "object_text": 1.25,
+            "scene_text": 1.0,
+            "current_observation": 1.15,
+            "scene": 0.9,
+        },
+    },
+    "ocr": {
+        "fields": ("ocr_text",),
+        "field_weights": {"ocr_text": 1.0},
+    },
+    "audio": {
+        "fields": ("audio_text",),
+        "field_weights": {"audio_text": 1.0},
+    },
+    "trake": {
+        "fields": (
+            "trake_text",
+            "event_caption",
+            "current_observation",
+            "before_context",
+            "after_context",
+            "temporal_caption",
+        ),
+        "field_weights": {
+            "trake_text": 1.35,
+            "event_caption": 1.15,
+            "current_observation": 1.15,
+            "before_context": 0.7,
+            "after_context": 0.7,
+            "temporal_caption": 0.8,
+        },
+    },
+    "all_text": {
+        "fields": ("all_text",),
+        "field_weights": {"all_text": 1.0},
+    },
+}
+
+RRF_ROUTE_CHANNEL_WEIGHTS = {
+    "audio": {
+        "audio": 1.45,
+        "trake": 0.55,
+        "visual": 0.35,
+        "ocr": 0.30,
+        "all_text": 0.20,
+    },
+    "ocr": {
+        "ocr": 1.50,
+        "visual": 0.45,
+        "trake": 0.35,
+        "audio": 0.20,
+        "all_text": 0.20,
+    },
+    "object_visual": {
+        "visual": 1.50,
+        "trake": 0.55,
+        "ocr": 0.35,
+        "audio": 0.15,
+        "all_text": 0.20,
+    },
+    "trake": {
+        "trake": 1.50,
+        "visual": 0.55,
+        "audio": 0.25,
+        "ocr": 0.20,
+        "all_text": 0.20,
+    },
+    "general": {
+        "visual": 1.00,
+        "trake": 0.90,
+        "ocr": 0.75,
+        "audio": 0.75,
+        "all_text": 0.30,
+    },
+}
+
+RRF_CHANNEL_UNIT_BONUS = {
+    "visual": {"frame": 0.25, "shot": 0.20, "event_step": 0.10},
+    "ocr": {"frame": 0.30, "shot": 0.20},
+    "audio": {"shot": 0.25, "event_step": 0.20},
+    "trake": {"event_step": 0.35, "shot": 0.15},
+    "all_text": {},
+}
+
 
 def run_local_retrieval(
     corpus: list[dict],
@@ -139,6 +239,8 @@ def run_local_retrieval(
             }
             if "step_order" in item["doc"]:
                 result["step_order"] = item["doc"].get("step_order")
+            if item.get("ranking_channels"):
+                result["ranking_channels"] = item.get("ranking_channels")
             results.append(result)
     return results
 
@@ -148,6 +250,9 @@ def _score_query(
     query: dict,
     scoring_profile: str,
 ) -> list[dict]:
+    if scoring_profile == "rrf":
+        return _score_query_rrf(corpus, query)
+
     query_text = query.get("query", "") or ""
     route = query.get("route", "general") or "general"
     query_terms = _query_terms_for_profile(tokenize(query_text), route, scoring_profile)
@@ -183,6 +288,139 @@ def _score_query(
     )
     return scored
 
+
+def _score_query_rrf(corpus: list[dict], query: dict) -> list[dict[str, Any]]:
+    query_text = query.get("query", "") or ""
+    route = query.get("route", "general") or "general"
+    query_terms = tokenize(query_text)
+    if not query_terms:
+        return []
+
+    target_units = set(query.get("target_unit_types") or [])
+    channel_weights = RRF_ROUTE_CHANNEL_WEIGHTS.get(
+        route,
+        RRF_ROUTE_CHANNEL_WEIGHTS["general"],
+    )
+    by_doc: dict[str, dict[str, Any]] = {}
+
+    for channel_name, channel_weight in channel_weights.items():
+        if channel_weight <= 0:
+            continue
+        channel = RRF_CHANNELS[channel_name]
+        channel_scored: list[dict[str, Any]] = []
+        for doc in corpus:
+            unit_type = doc.get("unit_type", "")
+            if target_units and unit_type not in target_units:
+                continue
+            raw_score, matched_fields, matched_terms = _score_doc_channel(
+                doc,
+                query_terms,
+                query_text,
+                channel_name,
+                channel,
+            )
+            if raw_score <= 0:
+                continue
+            channel_scored.append({
+                "doc": doc,
+                "raw_score": raw_score,
+                "matched_fields": matched_fields,
+                "matched_terms": matched_terms,
+            })
+
+        channel_scored.sort(
+            key=lambda item: (
+                -item["raw_score"],
+                item["doc"].get("start_sec", 0.0),
+                item["doc"].get("document_id", ""),
+            )
+        )
+
+        for rank, item in enumerate(channel_scored[:RRF_CHANNEL_DEPTH], start=1):
+            doc = item["doc"]
+            document_id = doc.get("document_id", "")
+            if not document_id:
+                continue
+            aggregate = by_doc.setdefault(document_id, {
+                "doc": doc,
+                "score": 0.0,
+                "raw_score": 0.0,
+                "matched_fields": set(),
+                "matched_terms": set(),
+                "ranking_channels": [],
+            })
+            aggregate["score"] += channel_weight / (RRF_K + rank)
+            aggregate["raw_score"] = max(aggregate["raw_score"], item["raw_score"])
+            aggregate["matched_fields"].update(item["matched_fields"])
+            aggregate["matched_terms"].update(item["matched_terms"])
+            aggregate["ranking_channels"].append(f"{channel_name}:{rank}")
+
+    scored: list[dict[str, Any]] = []
+    for aggregate in by_doc.values():
+        scored.append({
+            "doc": aggregate["doc"],
+            "score": aggregate["score"],
+            "raw_score": aggregate["raw_score"],
+            "matched_fields": sorted(aggregate["matched_fields"]),
+            "matched_terms": sorted(aggregate["matched_terms"]),
+            "ranking_channels": aggregate["ranking_channels"],
+        })
+
+    scored.sort(
+        key=lambda item: (
+            -item["score"],
+            -item["raw_score"],
+            item["doc"].get("start_sec", 0.0),
+            item["doc"].get("document_id", ""),
+        )
+    )
+    return scored
+
+
+def _score_doc_channel(
+    doc: dict,
+    query_terms: list[str],
+    query_text: str,
+    channel_name: str,
+    channel: dict[str, Any],
+) -> tuple[float, list[str], list[str]]:
+    fields = doc.get("fields") or {}
+    doc_boosts = doc.get("boosts") or {}
+    channel_fields = channel.get("fields") or ()
+    field_weights = channel.get("field_weights") or {}
+    matched_fields: list[str] = []
+    matched_terms: set[str] = set()
+    score = 0.0
+
+    for field in channel_fields:
+        text = fields.get(field, "") or ""
+        if not text:
+            continue
+        field_terms = tokenize(text)
+        if not field_terms:
+            continue
+        field_term_set = set(field_terms)
+        hits = [term for term in query_terms if term in field_term_set]
+        if not hits:
+            continue
+        weight = doc_boosts.get(field, 1.0) * field_weights.get(field, 1.0)
+        tf_score = sum(1.0 + math.log(1.0 + field_terms.count(term)) for term in hits)
+        coverage = len(hits) / max(len(query_terms), 1)
+        score += weight * (tf_score + coverage)
+        matched_fields.append(field)
+        matched_terms.update(hits)
+
+    phrase = normalized_text(query_text)
+    channel_text = normalized_text(" ".join(fields.get(field, "") or "" for field in channel_fields))
+    if phrase and phrase in channel_text:
+        score += 2.0
+
+    unit_type = doc.get("unit_type", "")
+    score += RRF_CHANNEL_UNIT_BONUS.get(channel_name, {}).get(unit_type, 0.0)
+    if channel_name == "trake" and unit_type == "event_step":
+        score += _temporal_role_bonus(doc, query_terms)
+
+    return score, matched_fields, sorted(matched_terms)
 
 def _score_doc(
     doc: dict,

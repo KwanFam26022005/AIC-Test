@@ -71,8 +71,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--scoring-profile",
         default="default",
-        choices=["default", "route_aware"],
-        help="Local lexical scoring profile. default preserves old behavior.",
+        choices=["default", "route_aware", "rrf"],
+        help="Local lexical scoring profile. default preserves old behavior; rrf uses channel fusion.",
     )
     parser.add_argument(
         "--write-es-bulk",
@@ -266,6 +266,3 @@ def _acceptance_problems(report: dict, strict: bool) -> list[str]:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
-
