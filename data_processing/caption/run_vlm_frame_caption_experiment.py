@@ -8,6 +8,7 @@ import logging
 import sys
 
 from caption_pipeline.vlm_frame_experiment import (
+    load_env_file,
     load_vlm_experiment_config,
     run_vlm_frame_experiment,
 )
@@ -20,6 +21,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Generate VLM frame-caption overrides for caption experiments.",
     )
     parser.add_argument("--config", required=True, help="YAML experiment config")
+    parser.add_argument(
+        "--env-file",
+        default="",
+        help="Optional .env file loaded before expanding YAML env vars",
+    )
     parser.add_argument("--video-id", default="", help="Override experiment.video_id")
     parser.add_argument("--experiment-name", default="", help="Override experiment.name")
     parser.add_argument("--provider", default="", help="Override model.provider")
@@ -40,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    if args.env_file:
+        load_env_file(args.env_file)
     cfg = load_vlm_experiment_config(args.config)
     _apply_overrides(cfg, args)
     report = run_vlm_frame_experiment(cfg)
@@ -76,3 +84,5 @@ def _apply_overrides(cfg: dict, args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+

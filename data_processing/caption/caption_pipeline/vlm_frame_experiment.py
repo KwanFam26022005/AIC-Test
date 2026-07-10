@@ -25,6 +25,33 @@ DEFAULT_PROMPT = (
 )
 
 
+
+def load_env_file(path: str | Path, override: bool = False) -> dict[str, str]:
+    """Load simple KEY=VALUE lines from a .env file into os.environ."""
+    target = Path(path)
+    if not target.exists():
+        raise FileNotFoundError(f"Missing env file: {target}")
+    loaded: dict[str, str] = {}
+    with target.open("r", encoding="utf-8") as f:
+        for line_no, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if "=" not in line:
+                raise ValueError(f"Invalid .env line {target}:{line_no}: {raw_line.rstrip()}")
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if not key:
+                raise ValueError(f"Invalid empty .env key at {target}:{line_no}")
+            if override or key not in os.environ:
+                os.environ[key] = value
+            loaded[key] = os.environ.get(key, value)
+    return loaded
+
+
 def load_vlm_experiment_config(path: str | Path) -> dict[str, Any]:
     """Load YAML config and expand environment variables in string values."""
     try:
@@ -406,4 +433,6 @@ def _expand_env(value):
     if isinstance(value, str):
         return os.path.expandvars(value)
     return value
+
+
 
