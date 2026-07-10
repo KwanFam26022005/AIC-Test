@@ -69,6 +69,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--top-k", type=int, default=20, help="Top-K results per query")
     parser.add_argument(
+        "--scoring-profile",
+        default="default",
+        choices=["default", "route_aware"],
+        help="Local lexical scoring profile. default preserves old behavior.",
+    )
+    parser.add_argument(
         "--write-es-bulk",
         action="store_true",
         help="Write Elasticsearch bulk JSONL files",
@@ -115,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("Queries:    %s", input_queries_path)
     logger.info("Exports:    %s", exports_dir)
     logger.info("Eval:       %s", eval_dir)
+    logger.info("Scoring:    %s", args.scoring_profile)
 
     missing = [str(path) for path in [compact_path, event_step_path] if not path.exists()]
     if missing:
@@ -177,7 +184,12 @@ def main(argv: list[str] | None = None) -> int:
     write_jsonl(output_queries_path, queries)
     logger.info("Wrote/loaded %d retrieval queries -> %s", len(queries), output_queries_path)
 
-    results = run_local_retrieval(corpus, queries, top_k=args.top_k)
+    results = run_local_retrieval(
+        corpus,
+        queries,
+        top_k=args.top_k,
+        scoring_profile=args.scoring_profile,
+    )
     results_path = eval_dir / "retrieval_results.jsonl"
     write_jsonl(results_path, results)
     logger.info("Wrote %d retrieval results -> %s", len(results), results_path)
@@ -190,6 +202,8 @@ def main(argv: list[str] | None = None) -> int:
         top_k=args.top_k,
         warnings=warnings,
     )
+    report["scoring_profile"] = args.scoring_profile
+    report["eval_name"] = args.eval_name or "default"
     report_json_path = eval_dir / "retrieval_eval_report.json"
     report_md_path = eval_dir / "retrieval_eval_report.md"
     write_json(report_json_path, report)
@@ -252,5 +266,6 @@ def _acceptance_problems(report: dict, strict: bool) -> list[str]:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 
 

@@ -83,6 +83,8 @@ def render_retrieval_report_markdown(report: dict[str, Any]) -> str:
     lines.append("| Metric | Value |")
     lines.append("|--------|------:|")
     metrics = [
+        ("Eval name", "eval_name"),
+        ("Scoring profile", "scoring_profile"),
         ("Corpus docs", "num_corpus_docs"),
         ("Queries", "num_queries"),
         ("Queries with hits", "num_queries_with_hits"),
@@ -176,3 +178,4 @@ def _count_duplicates(rows: list[dict], key: str) -> int:
             duplicates += 1
         seen.add(value)
     return duplicates
+
