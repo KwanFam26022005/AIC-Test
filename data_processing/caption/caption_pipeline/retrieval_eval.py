@@ -31,7 +31,7 @@ ROUTE_UNIT_BONUS = {
     "general": {},
 }
 
-SCORING_PROFILES = {"default", "route_aware", "rrf"}
+SCORING_PROFILES = {"default", "route_aware", "rrf", "route_gated_rrf"}
 
 ROUTE_AWARE_FIELD_MULTIPLIER = {
     "ocr": {
@@ -197,6 +197,21 @@ RRF_ROUTE_CHANNEL_WEIGHTS = {
     },
 }
 
+# Phase 11 uses hard modality gates. A routed query cannot gain rank from a
+# verbose caption copied into an unrelated channel such as audio or OCR.
+ROUTE_GATED_RRF_CHANNEL_WEIGHTS = {
+    "audio": {"audio": 1.0},
+    "ocr": {"ocr": 1.0},
+    "object_visual": {"visual": 1.0},
+    "trake": {"trake": 1.0},
+    "general": {
+        "visual": 1.0,
+        "trake": 0.85,
+        "ocr": 0.65,
+        "audio": 0.65,
+    },
+}
+
 RRF_CHANNEL_UNIT_BONUS = {
     "visual": {"frame": 0.25, "shot": 0.20, "event_step": 0.10},
     "ocr": {"frame": 0.30, "shot": 0.20},
@@ -250,8 +265,12 @@ def _score_query(
     query: dict,
     scoring_profile: str,
 ) -> list[dict]:
-    if scoring_profile == "rrf":
-        return _score_query_rrf(corpus, query)
+    if scoring_profile in {"rrf", "route_gated_rrf"}:
+        return _score_query_rrf(
+            corpus,
+            query,
+            route_gated=scoring_profile == "route_gated_rrf",
+        )
 
     query_text = query.get("query", "") or ""
     route = query.get("route", "general") or "general"
@@ -289,18 +308,24 @@ def _score_query(
     return scored
 
 
-def _score_query_rrf(corpus: list[dict], query: dict) -> list[dict[str, Any]]:
+def _score_query_rrf(
+    corpus: list[dict],
+    query: dict,
+    route_gated: bool = False,
+) -> list[dict[str, Any]]:
     query_text = query.get("query", "") or ""
     route = query.get("route", "general") or "general"
-    query_terms = tokenize(query_text)
+    query_terms = _rrf_query_terms(query_text, route, route_gated)
     if not query_terms:
         return []
 
     target_units = set(query.get("target_unit_types") or [])
-    channel_weights = RRF_ROUTE_CHANNEL_WEIGHTS.get(
-        route,
-        RRF_ROUTE_CHANNEL_WEIGHTS["general"],
+    weight_profiles = (
+        ROUTE_GATED_RRF_CHANNEL_WEIGHTS
+        if route_gated
+        else RRF_ROUTE_CHANNEL_WEIGHTS
     )
+    channel_weights = weight_profiles.get(route, weight_profiles["general"])
     by_doc: dict[str, dict[str, Any]] = {}
 
     for channel_name, channel_weight in channel_weights.items():
@@ -415,12 +440,27 @@ def _score_doc_channel(
     if phrase and phrase in channel_text:
         score += 2.0
 
+    # Unit-type preferences are tie-breakers for lexical matches, not matches
+    # by themselves. The old behavior admitted every frame/shot into a channel.
+    if score <= 0:
+        return 0.0, [], []
+
     unit_type = doc.get("unit_type", "")
     score += RRF_CHANNEL_UNIT_BONUS.get(channel_name, {}).get(unit_type, 0.0)
     if channel_name == "trake" and unit_type == "event_step":
         score += _temporal_role_bonus(doc, query_terms)
 
     return score, matched_fields, sorted(matched_terms)
+
+
+def _rrf_query_terms(query_text: str, route: str, route_gated: bool) -> list[str]:
+    terms = tokenize(query_text)
+    if not route_gated:
+        return terms
+    stop_terms = set(ROUTE_AWARE_GLOBAL_STOP_TERMS)
+    stop_terms.update(ROUTE_AWARE_ROUTE_STOP_TERMS.get(route, set()))
+    filtered = [term for term in terms if term not in stop_terms]
+    return filtered or terms
 
 def _score_doc(
     doc: dict,

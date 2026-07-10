@@ -27,6 +27,11 @@ from caption_pipeline.retrieval_export import (
     event_step_es_mapping,
 )
 from caption_pipeline.retrieval_queries import build_default_queries, normalize_queries
+from caption_pipeline.retrieval_metrics import (
+    build_ground_truth_template,
+    evaluate_ground_truth,
+    merge_ground_truth,
+)
 from caption_pipeline.retrieval_report import (
     build_retrieval_report,
     render_retrieval_report_markdown,
@@ -60,6 +65,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional retrieval_queries.jsonl override",
     )
     parser.add_argument(
+        "--ground-truth-jsonl",
+        default="",
+        help="Optional relevance judgments keyed by query_id",
+    )
+    parser.add_argument(
         "--eval-name",
         default="",
         help=(
@@ -71,8 +81,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--scoring-profile",
         default="default",
-        choices=["default", "route_aware", "rrf"],
-        help="Local lexical scoring profile. default preserves old behavior; rrf uses channel fusion.",
+        choices=["default", "route_aware", "rrf", "route_gated_rrf"],
+        help=(
+            "Local lexical scoring profile. route_gated_rrf applies Phase 11 "
+            "hard modality gates before channel fusion."
+        ),
+    )
+    parser.add_argument(
+        "--write-ground-truth-template",
+        action="store_true",
+        help="Write an empty ground_truth_template.jsonl for manual annotation",
+    )
+    parser.add_argument(
+        "--require-ground-truth",
+        action="store_true",
+        help="Fail acceptance when any query lacks a relevance judgment",
     )
     parser.add_argument(
         "--write-es-bulk",
@@ -122,6 +145,8 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("Exports:    %s", exports_dir)
     logger.info("Eval:       %s", eval_dir)
     logger.info("Scoring:    %s", args.scoring_profile)
+    if args.ground_truth_jsonl:
+        logger.info("GroundTruth: %s", args.ground_truth_jsonl)
 
     missing = [str(path) for path in [compact_path, event_step_path] if not path.exists()]
     if missing:
@@ -181,8 +206,22 @@ def main(argv: list[str] | None = None) -> int:
         write_default=args.write_default_queries,
     )
     queries = normalize_queries(queries, args.video_id)
+    if args.ground_truth_jsonl:
+        ground_truth_path = Path(args.ground_truth_jsonl)
+        if not ground_truth_path.exists():
+            logger.error("Missing ground-truth input: %s", ground_truth_path)
+            return 2
+        queries, ground_truth_warnings = merge_ground_truth(
+            queries,
+            read_jsonl(ground_truth_path),
+        )
+        warnings.extend(ground_truth_warnings)
     write_jsonl(output_queries_path, queries)
     logger.info("Wrote/loaded %d retrieval queries -> %s", len(queries), output_queries_path)
+    if args.write_ground_truth_template:
+        template_path = eval_dir / "ground_truth_template.jsonl"
+        write_jsonl(template_path, build_ground_truth_template(queries))
+        logger.info("Wrote ground-truth template -> %s", template_path)
 
     results = run_local_retrieval(
         corpus,
@@ -204,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     report["scoring_profile"] = args.scoring_profile
     report["eval_name"] = args.eval_name or "default"
+    report["ground_truth"] = evaluate_ground_truth(queries, results)
     report_json_path = eval_dir / "retrieval_eval_report.json"
     report_md_path = eval_dir / "retrieval_eval_report.md"
     write_json(report_json_path, report)
@@ -217,9 +257,27 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("  Queries: %d", len(queries))
     logger.info("  Results: %d", len(results))
     logger.info("  Hits:    %d/%d", report["num_queries_with_hits"], report["num_queries"])
+    ground_truth = report["ground_truth"]
+    logger.info(
+        "  Labeled: %d/%d queries",
+        ground_truth["num_labeled_queries"],
+        ground_truth["num_queries"],
+    )
+    if ground_truth["num_labeled_queries"]:
+        metrics = ground_truth["metrics"]
+        logger.info(
+            "  GT:      MRR %.3f | Recall@5 %.3f | nDCG@10 %.3f",
+            metrics.get("reciprocal_rank", 0.0),
+            metrics.get("recall_at_5", 0.0),
+            metrics.get("ndcg_at_10", 0.0),
+        )
     logger.info("  Warnings: %d", len(report.get("warnings", [])))
 
-    problems = _acceptance_problems(report, strict=args.strict)
+    problems = _acceptance_problems(
+        report,
+        strict=args.strict,
+        require_ground_truth=args.require_ground_truth,
+    )
     if problems:
         logger.warning("Acceptance issues: %s", "; ".join(problems))
         return 1 if args.strict else 0
@@ -247,7 +305,11 @@ def _named_output_dir(base: Path, eval_name: str) -> Path:
     return base / name
 
 
-def _acceptance_problems(report: dict, strict: bool) -> list[str]:
+def _acceptance_problems(
+    report: dict,
+    strict: bool,
+    require_ground_truth: bool = False,
+) -> list[str]:
     problems: list[str] = []
     if report.get("num_corpus_docs", 0) <= 0:
         problems.append("empty retrieval corpus")
@@ -257,6 +319,11 @@ def _acceptance_problems(report: dict, strict: bool) -> list[str]:
         problems.append(f"{report['empty_search_text_docs']} empty search_text docs")
     if report.get("num_queries_without_hits", 0) > 0:
         problems.append(f"{report['num_queries_without_hits']} queries without hits")
+    ground_truth = report.get("ground_truth") or {}
+    if require_ground_truth and ground_truth.get("num_unlabeled_queries", 0) > 0:
+        problems.append(
+            f"{ground_truth['num_unlabeled_queries']} queries without ground truth"
+        )
     if strict and report.get("warnings"):
         for warning in report.get("warnings") or []:
             if warning not in problems:

@@ -102,6 +102,10 @@ def render_retrieval_report_markdown(report: dict[str, Any]) -> str:
     _append_counts(lines, "Route Counts", report.get("route_counts") or {})
     _append_counts(lines, "Unit Type Hits At 1", report.get("unit_type_hits_at_1") or {})
 
+    ground_truth = report.get("ground_truth") or {}
+    if ground_truth:
+        _append_ground_truth_metrics(lines, ground_truth)
+
     warnings = report.get("warnings") or []
     lines.append("## Status")
     lines.append("")
@@ -150,6 +154,12 @@ def render_retrieval_report_markdown(report: dict[str, Any]) -> str:
             f"Queries without hits: {report.get('num_queries_without_hits', 0)}",
         ),
     ]
+    if ground_truth.get("num_labeled_queries", 0) > 0:
+        checks.append((
+            ground_truth.get("num_unlabeled_queries", 0) == 0,
+            "Ground-truth coverage: "
+            f"{ground_truth.get('num_labeled_queries', 0)}/{ground_truth.get('num_queries', 0)}",
+        ))
     for passed, desc in checks:
         status = "[PASS]" if passed else "[FAIL]"
         lines.append(f"- {status} {desc}")
@@ -167,6 +177,39 @@ def _append_counts(lines: list[str], title: str, counts: dict[str, int]) -> None
     for key, value in sorted(counts.items()):
         lines.append(f"| {key} | {value} |")
     lines.append("")
+
+
+def _append_ground_truth_metrics(lines: list[str], ground_truth: dict[str, Any]) -> None:
+    lines.append("## Ground Truth Metrics")
+    lines.append("")
+    lines.append(
+        f"Labeled queries: {ground_truth.get('num_labeled_queries', 0)}/"
+        f"{ground_truth.get('num_queries', 0)}"
+    )
+    lines.append("")
+    metrics = ground_truth.get("metrics") or {}
+    lines.append("| Scope | Hit@1 | Recall@1 | Recall@5 | Recall@10 | MRR | nDCG@10 |")
+    lines.append("|-------|------:|---------:|---------:|----------:|----:|--------:|")
+    _append_metric_row(lines, "all", metrics)
+    for route, row in sorted((ground_truth.get("per_route") or {}).items()):
+        _append_metric_row(lines, route, row.get("metrics") or {})
+    lines.append("")
+
+    unlabeled = ground_truth.get("unlabeled_query_ids") or []
+    if unlabeled:
+        lines.append("Unlabeled queries: " + ", ".join(unlabeled))
+        lines.append("")
+
+
+def _append_metric_row(lines: list[str], scope: str, metrics: dict[str, float]) -> None:
+    lines.append(
+        f"| {scope} | {metrics.get('hit_at_1', 0.0):.3f} | "
+        f"{metrics.get('recall_at_1', 0.0):.3f} | "
+        f"{metrics.get('recall_at_5', 0.0):.3f} | "
+        f"{metrics.get('recall_at_10', 0.0):.3f} | "
+        f"{metrics.get('reciprocal_rank', 0.0):.3f} | "
+        f"{metrics.get('ndcg_at_10', 0.0):.3f} |"
+    )
 
 
 def _count_duplicates(rows: list[dict], key: str) -> int:

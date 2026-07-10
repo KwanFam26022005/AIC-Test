@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .io_utils import read_json, read_jsonl, utc_now_iso
+from .retrieval_metrics import match_result_relevance, normalize_relevance_judgments
 from .text_utils import truncate
 
 def load_experiment(label: str, root: str | Path, video_id: str, eval_name: str = "") -> dict[str, Any]:
@@ -67,6 +68,8 @@ def summarize_experiment(
     ]
     hit_queries = set(top1_by_query)
     warnings = report.get("warnings") or []
+    ground_truth = report.get("ground_truth") or {}
+    relevance_metrics = ground_truth.get("metrics") or {}
     unit_at_1: dict[str, int] = defaultdict(int)
     matched_field_counts: dict[str, int] = defaultdict(int)
     for qid, row in top1_by_query.items():
@@ -91,6 +94,14 @@ def summarize_experiment(
         "num_warnings": len(warnings),
         "unit_type_hits_at_1": dict(sorted(unit_at_1.items())),
         "matched_field_counts_at_1": dict(sorted(matched_field_counts.items())),
+        "num_labeled_queries": ground_truth.get("num_labeled_queries", 0),
+        "num_unlabeled_queries": ground_truth.get("num_unlabeled_queries", len(queries)),
+        "hit_at_1": relevance_metrics.get("hit_at_1", 0.0),
+        "recall_at_1": relevance_metrics.get("recall_at_1", 0.0),
+        "recall_at_5": relevance_metrics.get("recall_at_5", 0.0),
+        "recall_at_10": relevance_metrics.get("recall_at_10", 0.0),
+        "mrr": relevance_metrics.get("reciprocal_rank", 0.0),
+        "ndcg_at_10": relevance_metrics.get("ndcg_at_10", 0.0),
     }
 
 def build_benchmark_report(
@@ -109,6 +120,10 @@ def build_benchmark_report(
     ranking = sorted(
         [item["summary"] for item in candidates],
         key=lambda row: (
+            -int(row.get("num_labeled_queries", 0) > 0),
+            -float(row.get("ndcg_at_10", 0.0)),
+            -float(row.get("mrr", 0.0)),
+            -float(row.get("recall_at_5", 0.0)),
             -float(row.get("hit_rate", 0.0)),
             -float(row.get("avg_top1_score", 0.0)),
             int(row.get("num_warnings", 0)),
@@ -117,6 +132,11 @@ def build_benchmark_report(
     )
 
     warnings: list[str] = []
+    labeled_counts = {
+        item["summary"].get("num_labeled_queries", 0) for item in candidates
+    }
+    if len(labeled_counts) > 1:
+        warnings.append("candidates have inconsistent ground-truth coverage")
     for item in candidates:
         label = item["label"]
         summary = item["summary"]
@@ -128,7 +148,7 @@ def build_benchmark_report(
             warnings.append(f"{label}: {summary['num_warnings']} retrieval warnings")
 
     return {
-        "schema_version": "caption_phase6_experiment_benchmark_v1",
+        "schema_version": "caption_phase11_experiment_benchmark_v2",
         "video_id": video_id,
         "created_at": utc_now_iso(),
         "baseline_label": baseline["label"],
@@ -159,8 +179,10 @@ def build_manual_review_samples(
             "query_id": query_id,
             "query": query_map[query_id].get("query", ""),
             "route": query_map[query_id].get("route", ""),
+            "relevance_judgments": normalize_relevance_judgments(query_map[query_id]),
             "candidates": [],
         }
+        judgments = item["relevance_judgments"]
         for candidate in candidates:
             top_rows = [
                 row for row in candidate["results"]
@@ -168,7 +190,7 @@ def build_manual_review_samples(
             ]
             item["candidates"].append({
                 "label": candidate["label"],
-                "top_results": [_sample_result(row) for row in top_rows],
+                "top_results": [_sample_result(row, judgments) for row in top_rows],
             })
         samples.append(item)
     return samples
@@ -181,6 +203,23 @@ def render_benchmark_report_markdown(report: dict[str, Any]) -> str:
     lines.append(f"Created: {report.get('created_at', 'N/A')}")
     lines.append("")
 
+    if any(row.get("num_labeled_queries", 0) for row in report.get("candidate_summaries") or []):
+        lines.append("## Ground Truth Metrics")
+        lines.append("")
+        lines.append(
+            "| Label | Labeled | Hit@1 | Recall@1 | Recall@5 | Recall@10 | MRR | nDCG@10 |"
+        )
+        lines.append(
+            "|-------|--------:|------:|---------:|---------:|----------:|----:|--------:|"
+        )
+        for row in report.get("candidate_summaries") or []:
+            lines.append(
+                f"| {row['label']} | {row['num_labeled_queries']} | "
+                f"{row['hit_at_1']:.3f} | {row['recall_at_1']:.3f} | "
+                f"{row['recall_at_5']:.3f} | {row['recall_at_10']:.3f} | "
+                f"{row['mrr']:.3f} | {row['ndcg_at_10']:.3f} |"
+            )
+        lines.append("")
     lines.append("## Candidate Summary")
     lines.append("")
     lines.append(
@@ -197,18 +236,44 @@ def render_benchmark_report_markdown(report: dict[str, Any]) -> str:
 
     lines.append("## Ranking")
     lines.append("")
-    lines.append("| Rank | Label | Hit Rate | Avg Top1 | Warnings |")
-    lines.append("|-----:|-------|---------:|---------:|---------:|")
+    has_ground_truth = any(
+        row.get("num_labeled_queries", 0) for row in report.get("ranking") or []
+    )
+    if has_ground_truth:
+        lines.append("| Rank | Label | nDCG@10 | MRR | Recall@5 | Warnings |")
+        lines.append("|-----:|-------|--------:|----:|---------:|---------:|")
+    else:
+        lines.append("| Rank | Label | Hit Rate | Avg Top1 | Warnings |")
+        lines.append("|-----:|-------|---------:|---------:|---------:|")
     for idx, row in enumerate(report.get("ranking") or [], start=1):
-        lines.append(
-            f"| {idx} | {row['label']} | {row['hit_rate']:.3f} | "
-            f"{row['avg_top1_score']:.3f} | {row['num_warnings']} |"
-        )
+        if has_ground_truth:
+            lines.append(
+                f"| {idx} | {row['label']} | {row['ndcg_at_10']:.3f} | "
+                f"{row['mrr']:.3f} | {row['recall_at_5']:.3f} | "
+                f"{row['num_warnings']} |"
+            )
+        else:
+            lines.append(
+                f"| {idx} | {row['label']} | {row['hit_rate']:.3f} | "
+                f"{row['avg_top1_score']:.3f} | {row['num_warnings']} |"
+            )
     lines.append("")
 
     comparisons = report.get("comparisons_to_baseline") or []
     if comparisons:
-        lines.append("## Comparison To Baseline")
+        if has_ground_truth:
+            lines.append("## Ground Truth Comparison To Baseline")
+            lines.append("")
+            lines.append("| Experiment | MRR Delta | Recall@5 Delta | nDCG@10 Delta |")
+            lines.append("|------------|----------:|---------------:|--------------:|")
+            for row in comparisons:
+                lines.append(
+                    f"| {row['experiment_label']} | {row['mrr_delta']:.3f} | "
+                    f"{row['recall_at_5_delta']:.3f} | {row['ndcg_at_10_delta']:.3f} |"
+                )
+            lines.append("")
+
+        lines.append("## Raw Score Comparison To Baseline")
         lines.append("")
         lines.append(
             "| Experiment | Shared Queries | Improved | Regressed | Same Top1 | Avg Top1 Delta |"
@@ -277,6 +342,18 @@ def _compare_to_baseline(
         "num_same_top1_document": same_doc,
         "num_changed_top1_document": len(changed),
         "avg_top1_score_delta": _mean(deltas),
+        "mrr_delta": (
+            experiment["summary"].get("mrr", 0.0)
+            - baseline["summary"].get("mrr", 0.0)
+        ),
+        "recall_at_5_delta": (
+            experiment["summary"].get("recall_at_5", 0.0)
+            - baseline["summary"].get("recall_at_5", 0.0)
+        ),
+        "ndcg_at_10_delta": (
+            experiment["summary"].get("ndcg_at_10", 0.0)
+            - baseline["summary"].get("ndcg_at_10", 0.0)
+        ),
         "changed_top1_documents": changed[:50],
     }
 
@@ -304,8 +381,11 @@ def _top_result_by_query(results: list[dict], rank: int) -> dict[str, dict]:
             rows[query_id] = row
     return rows
 
-def _sample_result(row: dict) -> dict[str, Any]:
-    return {
+def _sample_result(
+    row: dict,
+    judgments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    item = {
         "rank": row.get("rank", 0),
         "score": row.get("score", 0.0),
         "document_id": row.get("document_id", ""),
@@ -319,6 +399,12 @@ def _sample_result(row: dict) -> dict[str, Any]:
         "matched_terms": row.get("matched_terms") or [],
         "snippet": truncate(row.get("snippet", "") or "", 360),
     }
+    matched = match_result_relevance(row, judgments or [])
+    item["is_relevant"] = bool(matched)
+    item["matched_relevance_targets"] = [
+        judgment["target_key"] for judgment in matched
+    ]
+    return item
 
 def _mean(values: list[float]) -> float:
     if not values:
