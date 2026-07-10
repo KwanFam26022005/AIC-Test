@@ -47,6 +47,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Experiment in label=path form. Can be repeated.",
     )
     parser.add_argument(
+        "--eval-name",
+        default="",
+        help="Optional named eval/export subdirectory to compare, e.g. visual.",
+    )
+    parser.add_argument(
         "--output-dir",
         default="",
         help="Output dir. Default: <baseline video dir>/benchmarks/<benchmark-name>",
@@ -81,9 +86,9 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.monotonic()
 
     logger.info("=== Caption Phase 6 Benchmark - %s ===", args.video_id)
-    baseline = load_experiment(args.baseline_label, args.baseline_dir, args.video_id)
+    baseline = load_experiment(args.baseline_label, args.baseline_dir, args.video_id, args.eval_name)
     experiments = [
-        load_experiment(label, path, args.video_id)
+        load_experiment(label, path, args.video_id, args.eval_name)
         for label, path in _parse_experiments(args.experiment)
     ]
 
@@ -93,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
         args.video_id,
         args.benchmark_name,
     )
+    if args.eval_name:
+        logger.info("EvalName:    %s", args.eval_name)
     logger.info("Baseline:    %s -> %s", args.baseline_label, baseline["video_dir"])
     for exp in experiments:
         logger.info("Experiment:  %s -> %s", exp["label"], exp["video_dir"])
@@ -166,3 +173,4 @@ def _resolve_output_dir(
 
 if __name__ == "__main__":
     sys.exit(main())
+

@@ -9,13 +9,12 @@ from typing import Any
 from .io_utils import read_json, read_jsonl, utc_now_iso
 from .text_utils import truncate
 
-
-def load_experiment(label: str, root: str | Path, video_id: str) -> dict[str, Any]:
+def load_experiment(label: str, root: str | Path, video_id: str, eval_name: str = "") -> dict[str, Any]:
     """Load Phase 5 retrieval outputs for one benchmark candidate."""
     root_path = Path(root)
     video_dir = _resolve_video_dir(root_path, video_id)
-    eval_dir = video_dir / "eval"
-    exports_dir = video_dir / "exports"
+    eval_dir = _named_artifact_dir(video_dir / "eval", eval_name)
+    exports_dir = _named_artifact_dir(video_dir / "exports", eval_name)
 
     report_path = eval_dir / "retrieval_eval_report.json"
     results_path = eval_dir / "retrieval_results.jsonl"
@@ -50,7 +49,6 @@ def load_experiment(label: str, root: str | Path, video_id: str) -> dict[str, An
         "corpus": corpus,
         "summary": summarize_experiment(label, report, results, queries, corpus),
     }
-
 
 def summarize_experiment(
     label: str,
@@ -94,7 +92,6 @@ def summarize_experiment(
         "unit_type_hits_at_1": dict(sorted(unit_at_1.items())),
         "matched_field_counts_at_1": dict(sorted(matched_field_counts.items())),
     }
-
 
 def build_benchmark_report(
     video_id: str,
@@ -143,7 +140,6 @@ def build_benchmark_report(
         "warnings": warnings,
     }
 
-
 def build_manual_review_samples(
     baseline: dict[str, Any],
     experiments: list[dict[str, Any]],
@@ -176,7 +172,6 @@ def build_manual_review_samples(
             })
         samples.append(item)
     return samples
-
 
 def render_benchmark_report_markdown(report: dict[str, Any]) -> str:
     """Render Phase 6 benchmark report as Markdown."""
@@ -238,7 +233,6 @@ def render_benchmark_report_markdown(report: dict[str, Any]) -> str:
     lines.append("")
     return "\n".join(lines)
 
-
 def _compare_to_baseline(
     baseline: dict[str, Any],
     experiment: dict[str, Any],
@@ -286,12 +280,19 @@ def _compare_to_baseline(
         "changed_top1_documents": changed[:50],
     }
 
+def _named_artifact_dir(base: Path, eval_name: str) -> Path:
+    name = (eval_name or "").strip().strip("/\\")
+    if not name:
+        return base
+    if "/" in name or "\\" in name:
+        raise ValueError(f"Invalid eval_name '{eval_name}'. Use a simple folder name.")
+    return base / name
+
 
 def _resolve_video_dir(root: Path, video_id: str) -> Path:
     if (root / "eval").exists() and (root / "exports").exists():
         return root
     return root / video_id
-
 
 def _top_result_by_query(results: list[dict], rank: int) -> dict[str, dict]:
     rows: dict[str, dict] = {}
@@ -302,7 +303,6 @@ def _top_result_by_query(results: list[dict], rank: int) -> dict[str, dict]:
         if query_id and query_id not in rows:
             rows[query_id] = row
     return rows
-
 
 def _sample_result(row: dict) -> dict[str, Any]:
     return {
@@ -320,14 +320,14 @@ def _sample_result(row: dict) -> dict[str, Any]:
         "snippet": truncate(row.get("snippet", "") or "", 360),
     }
 
-
 def _mean(values: list[float]) -> float:
     if not values:
         return 0.0
     return sum(values) / len(values)
 
-
 def _safe_div(num: float, den: float) -> float:
     if den == 0:
         return 0.0
     return float(num) / float(den)
+
+

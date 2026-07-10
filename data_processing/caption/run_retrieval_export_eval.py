@@ -34,7 +34,6 @@ from caption_pipeline.retrieval_report import (
 
 logger = logging.getLogger("caption_retrieval")
 
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Export caption outputs for retrieval and run offline eval.",
@@ -60,6 +59,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="",
         help="Optional retrieval_queries.jsonl override",
     )
+    parser.add_argument(
+        "--eval-name",
+        default="",
+        help=(
+            "Optional named eval/export subdirectory. Example: --eval-name visual "
+            "writes eval/visual/* and exports/visual/* without overwriting default eval."
+        ),
+    )
     parser.add_argument("--top-k", type=int, default=20, help="Top-K results per query")
     parser.add_argument(
         "--write-es-bulk",
@@ -79,7 +86,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
     return parser.parse_args(argv)
 
-
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(
@@ -90,22 +96,23 @@ def main(argv: list[str] | None = None) -> int:
 
     t0 = time.monotonic()
     base_dir = Path(args.caption_dir) / args.video_id
-    exports_dir = base_dir / "exports"
-    eval_dir = base_dir / "eval"
+    exports_dir = _named_output_dir(base_dir / "exports", args.eval_name)
+    eval_dir = _named_output_dir(base_dir / "eval", args.eval_name)
     compact_path = Path(args.compact_index) if args.compact_index else (
         base_dir / "indexes" / "compact_search_index.jsonl"
     )
     event_step_path = Path(args.event_step_index) if args.event_step_index else (
         base_dir / "captions" / "event_step_index.jsonl"
     )
-    queries_path = Path(args.queries_jsonl) if args.queries_jsonl else (
+    input_queries_path = Path(args.queries_jsonl) if args.queries_jsonl else (
         eval_dir / "retrieval_queries.jsonl"
     )
+    output_queries_path = eval_dir / "retrieval_queries.jsonl"
 
     logger.info("=== Caption Retrieval Export/Eval - %s ===", args.video_id)
     logger.info("Compact:    %s", compact_path)
     logger.info("EventStep:  %s", event_step_path)
-    logger.info("Queries:    %s", queries_path)
+    logger.info("Queries:    %s", input_queries_path)
     logger.info("Exports:    %s", exports_dir)
     logger.info("Eval:       %s", eval_dir)
 
@@ -162,13 +169,13 @@ def main(argv: list[str] | None = None) -> int:
             warnings.append("event-step ES bulk line count mismatch")
 
     queries = _load_or_build_queries(
-        queries_path=queries_path,
+        queries_path=input_queries_path,
         video_id=args.video_id,
         write_default=args.write_default_queries,
     )
     queries = normalize_queries(queries, args.video_id)
-    write_jsonl(queries_path, queries)
-    logger.info("Wrote/loaded %d retrieval queries -> %s", len(queries), queries_path)
+    write_jsonl(output_queries_path, queries)
+    logger.info("Wrote/loaded %d retrieval queries -> %s", len(queries), output_queries_path)
 
     results = run_local_retrieval(corpus, queries, top_k=args.top_k)
     results_path = eval_dir / "retrieval_results.jsonl"
@@ -205,7 +212,6 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("All retrieval export/eval acceptance checks passed.")
     return 0
 
-
 def _load_or_build_queries(
     queries_path: Path,
     video_id: str,
@@ -217,6 +223,14 @@ def _load_or_build_queries(
             return rows
     rows = build_default_queries(video_id)
     return rows
+
+def _named_output_dir(base: Path, eval_name: str) -> Path:
+    name = (eval_name or "").strip().strip("/\\")
+    if not name:
+        return base
+    if "/" in name or "\\" in name:
+        raise ValueError(f"Invalid --eval-name '{eval_name}'. Use a simple folder name.")
+    return base / name
 
 
 def _acceptance_problems(report: dict, strict: bool) -> list[str]:
@@ -238,3 +252,5 @@ def _acceptance_problems(report: dict, strict: bool) -> list[str]:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
