@@ -18,11 +18,25 @@ OCR_V2_PADDLE_ENGINE=paddle_dynamic \
 OCR_V2_VINTERN_ATTN=flash_attention_2 \
 PYTHONIOENCODING=utf-8 \
 python data_processing/vintern_grounding_demo/run_vintern_grounding_demo.py \
-  --image /tmp2/maitanha/vgu/ttn/AIC-Khoa/AIC-Test/keyframe_test/L22_V012/L22_V012_001.jpg \
-  --bbox 100,120,420,190 \
-  --ocr-text "text loi neu co" \
+  --video-id L22_V012 \
+  --frame-id L22_V012_001 \
+  --ocr-root /tmp2/maitanha/vgu/ttn/AIC-Khoa/AIC-Test/outputs/ocr_vlm_pipeline_v2 \
+  --frames-root /tmp2/maitanha/vgu/ttn/AIC-Khoa/AIC-Test/keyframe_test \
   --model-id 5CD-AI/Vintern-3B-beta \
   --output-dir /tmp2/maitanha/vgu/ttn/AIC-Khoa/AIC-Test/outputs/vintern_grounding_demo/L22_V012_001
+```
+
+Muốn kiểm tra bbox/crop trước khi load model, thêm `--dry-run`:
+
+```bash
+PYTHONIOENCODING=utf-8 \
+python data_processing/vintern_grounding_demo/run_vintern_grounding_demo.py \
+  --video-id L22_V012 \
+  --frame-id L22_V012_001 \
+  --ocr-root /tmp2/maitanha/vgu/ttn/AIC-Khoa/AIC-Test/outputs/ocr_vlm_pipeline_v2 \
+  --frames-root /tmp2/maitanha/vgu/ttn/AIC-Khoa/AIC-Test/keyframe_test \
+  --output-dir /tmp2/maitanha/vgu/ttn/AIC-Khoa/AIC-Test/outputs/vintern_grounding_demo/L22_V012_001_dry \
+  --dry-run
 ```
 
 Nếu muốn chạy trên GPU khác, đổi `CUDA_VISIBLE_DEVICES`, ví dụ `CUDA_VISIBLE_DEVICES=1`. Bên trong process vẫn dùng `cuda:0` vì CUDA đã remap device.
@@ -37,6 +51,8 @@ Script tạo:
 - `summary.html`: mở bằng browser/http.server để xem nhanh.
 
 ## Cách đọc kết quả
+
+Khi dùng `--frame-id`, script tự đọc `<ocr-root>/<video-id>/<video-id>_ocr_es_docs.jsonl`, tìm đúng frame, rồi chọn một OCR line bbox đại diện. Mặc định nó ưu tiên line từng được đánh dấu `send_to_vintern` hoặc `need_review`; nếu không có thì chọn line có score thấp/text dài/vùng lớn. Muốn đổi candidate trong cùng frame, tăng `--candidate-index 1`, `--candidate-index 2`, ...
 
 - Nếu `full_coord` sai nhưng `crop_expanded` đúng: Vintern đọc chữ được, nhưng coordinate grounding yếu hoặc bị ảnh hưởng resize/tile.
 - Nếu `full_box` đúng hơn `full_coord`: model bám visual marker tốt hơn tọa độ số.

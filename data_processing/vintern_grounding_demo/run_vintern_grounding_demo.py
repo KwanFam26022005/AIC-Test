@@ -36,6 +36,116 @@ from ocr_pipeline.recognizers.vintern_recognizer import (  # noqa: E402
 LOGGER = logging.getLogger("vintern_grounding_demo")
 
 
+def infer_video_id(frame_id: str) -> str | None:
+    parts = frame_id.split("_")
+    if len(parts) >= 2:
+        return "_".join(parts[:2])
+    return None
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    docs = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                docs.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL at {path}:{line_no}: {exc}") from exc
+    return docs
+
+
+def resolve_ocr_jsonl(repo_root: Path, video_id: str, ocr_root: Path | None, ocr_jsonl: Path | None) -> Path:
+    if ocr_jsonl is not None:
+        return ocr_jsonl
+    root = ocr_root or (repo_root / "outputs" / "ocr_vlm_pipeline_v2")
+    candidates = [
+        root / video_id / f"{video_id}_ocr_es_docs.jsonl",
+        root / f"{video_id}_ocr_es_docs.jsonl",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        "Cannot find OCR JSONL. Tried: "
+        + ", ".join(str(path) for path in candidates)
+        + ". Pass --ocr-jsonl explicitly if output is elsewhere."
+    )
+
+
+def find_ocr_doc(docs: list[dict[str, Any]], frame_id: str) -> dict[str, Any]:
+    normalized = frame_id.removesuffix(".jpg").removesuffix(".png")
+    for doc in docs:
+        values = {
+            str(doc.get("frame_id") or ""),
+            str(doc.get("canonical_frame_id") or ""),
+            str(doc.get("legacy_frame_id") or ""),
+            str(doc.get("frame_name") or ""),
+            Path(str(doc.get("image_path") or "")).stem,
+        }
+        media = doc.get("media") if isinstance(doc.get("media"), dict) else {}
+        values.update({
+            str(media.get("frame_id") or ""),
+            str(media.get("canonical_frame_id") or ""),
+            str(media.get("legacy_frame_id") or ""),
+            str(media.get("frame_name") or ""),
+        })
+        values = {value.removesuffix(".jpg").removesuffix(".png") for value in values if value}
+        if normalized in values or frame_id in values:
+            return doc
+    raise KeyError(f"Frame id not found in OCR JSONL: {frame_id}")
+
+
+def resolve_image_from_doc(doc: dict[str, Any], frames_root: Path | None) -> Path:
+    media = doc.get("media") if isinstance(doc.get("media"), dict) else {}
+    for raw in (doc.get("image_path"), media.get("image_path")):
+        if raw:
+            path = Path(str(raw))
+            if path.exists():
+                return path
+    rel = doc.get("image_relpath") or media.get("image_relpath")
+    if rel and frames_root is not None:
+        path = frames_root / str(rel)
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        "Cannot resolve frame image from OCR doc. Pass --image explicitly, "
+        "or pass --frames-root pointing to keyframe_test."
+    )
+
+
+def line_candidate_score(line: dict[str, Any]) -> tuple[float, float, float, float]:
+    bbox = line.get("bbox_xyxy") or [0, 0, 0, 0]
+    try:
+        area = max(0.0, float(bbox[2]) - float(bbox[0])) * max(0.0, float(bbox[3]) - float(bbox[1]))
+    except Exception:
+        area = 0.0
+    text = (line.get("final_text") or line.get("vietocr_text") or line.get("vintern_text") or "").strip()
+    composite = line.get("composite_score")
+    try:
+        composite_value = float(composite)
+    except Exception:
+        composite_value = 1.0
+    suspicious = 1.0 if line.get("send_to_vintern") or line.get("need_review") else 0.0
+    return suspicious, 1.0 - composite_value, float(len(text)), area
+
+
+def ranked_ocr_lines(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    lines = [line for line in doc.get("ocr_lines", []) if line.get("bbox_xyxy")]
+    if not lines:
+        raise ValueError("OCR doc has no ocr_lines with bbox_xyxy.")
+    return sorted(lines, key=line_candidate_score, reverse=True)
+
+
+def pick_ocr_line(doc: dict[str, Any], candidate_index: int) -> dict[str, Any]:
+    ranked = ranked_ocr_lines(doc)
+    if candidate_index < 0 or candidate_index >= len(ranked):
+        raise IndexError(f"--candidate-index {candidate_index} out of range; frame has {len(ranked)} candidates.")
+    return ranked[candidate_index]
+
+
 def parse_bbox(raw: str) -> tuple[int, int, int, int]:
     parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
     if len(parts) != 4:
@@ -226,9 +336,16 @@ def write_html(result: dict[str, Any], output_dir: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Test Vintern coordinate grounding on one frame.")
-    parser.add_argument("--image", required=True, type=Path, help="Path to the source frame image.")
-    parser.add_argument("--bbox", required=True, type=parse_bbox, help="Target bbox in original pixels: x1,y1,x2,y2.")
-    parser.add_argument("--ocr-text", default="", help="Optional existing/wrong OCR text hint.")
+    parser.add_argument("--image", type=Path, help="Path to the source frame image. Optional when --frame-id is used.")
+    parser.add_argument("--bbox", type=parse_bbox, help="Target bbox in original pixels: x1,y1,x2,y2. Optional when --frame-id is used.")
+    parser.add_argument("--frame-id", help="Frame id to look up from old OCR output, e.g. L22_V012_001.")
+    parser.add_argument("--video-id", help="Video id, e.g. L22_V012. Inferred from --frame-id when omitted.")
+    parser.add_argument("--ocr-jsonl", type=Path, help="Exact OCR ES JSONL path.")
+    parser.add_argument("--ocr-root", type=Path, help="OCR output root. Default: <repo>/outputs/ocr_vlm_pipeline_v2.")
+    parser.add_argument("--frames-root", type=Path, help="Frames root used to resolve image_relpath. Default: <repo>/keyframe_test.")
+    parser.add_argument("--candidate-index", type=int, default=0, help="Ranked OCR line candidate index within the frame.")
+    parser.add_argument("--dry-run", action="store_true", help="Resolve OCR bbox and write crop/box artifacts without loading Vintern.")
+    parser.add_argument("--ocr-text", default=None, help="Optional existing/wrong OCR text hint. Defaults to selected OCR line text.")
     parser.add_argument("--model-id", default="5CD-AI/Vintern-3B-beta", help="HF model id.")
     parser.add_argument("--output-dir", required=True, type=Path, help="Directory for demo artifacts.")
     parser.add_argument("--device", default=None, help="Torch device, default auto cuda:0/cpu.")
@@ -250,8 +367,42 @@ def main() -> int:
         datefmt="%H:%M:%S",
     )
 
-    if not args.image.exists():
+    if args.image is not None and not args.image.exists():
         raise FileNotFoundError(args.image)
+
+    if args.frame_id and (args.image is None or args.bbox is None):
+        video_id = args.video_id or infer_video_id(args.frame_id)
+        if not video_id:
+            raise ValueError("--video-id is required when it cannot be inferred from --frame-id")
+        ocr_jsonl = resolve_ocr_jsonl(REPO_ROOT, video_id, args.ocr_root, args.ocr_jsonl)
+        LOGGER.info("Reading OCR output: %s", ocr_jsonl)
+        doc = find_ocr_doc(read_jsonl(ocr_jsonl), args.frame_id)
+        line = pick_ocr_line(doc, args.candidate_index)
+        if args.image is None:
+            args.image = resolve_image_from_doc(doc, args.frames_root or (REPO_ROOT / "keyframe_test"))
+        if args.bbox is None:
+            args.bbox = parse_bbox(",".join(str(v) for v in line["bbox_xyxy"]))
+        if args.ocr_text is None:
+            args.ocr_text = (
+                line.get("final_text")
+                or line.get("vietocr_text")
+                or line.get("vintern_text")
+                or ""
+            )
+        LOGGER.info(
+            "Selected OCR line: line_id=%s bbox=%s text=%r score=%s send_to_vintern=%s need_review=%s",
+            line.get("line_id"),
+            args.bbox,
+            args.ocr_text,
+            line.get("composite_score"),
+            line.get("send_to_vintern"),
+            line.get("need_review"),
+        )
+
+    if args.image is None or args.bbox is None:
+        raise ValueError("Provide either --frame-id with old OCR output, or both --image and --bbox.")
+    if args.ocr_text is None:
+        args.ocr_text = ""
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     image = Image.open(args.image).convert("RGB")
@@ -267,6 +418,22 @@ def main() -> int:
     save_image(image, full_path)
     save_image(full_with_box, boxed_path)
     save_image(crop, crop_path)
+
+    if args.dry_run:
+        dry_result = {
+            "image": str(args.image),
+            "image_size": [width, height],
+            "bbox": list(bbox),
+            "expanded_bbox": list(expanded),
+            "ocr_text_hint": args.ocr_text,
+            "note": "dry_run_only_no_vintern_loaded",
+        }
+        dry_path = args.output_dir / "selected_region.json"
+        dry_path.write_text(json.dumps(dry_result, ensure_ascii=False, indent=2), encoding="utf-8")
+        LOGGER.info("Dry run wrote selected region -> %s", dry_path)
+        LOGGER.info("Dry run wrote full frame with box -> %s", boxed_path)
+        LOGGER.info("Dry run wrote expanded crop -> %s", crop_path)
+        return 0
 
     cfg = make_config(
         vintern_model_id=args.model_id,
