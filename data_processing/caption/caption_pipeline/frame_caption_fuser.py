@@ -14,6 +14,7 @@ import logging
 from typing import Any
 
 from .config import PipelineConfig
+from .progress import progress_iter
 from .runtime import JsonlCheckpoint, TextLLMRuntime, stable_input_signature
 from .runtime.json_output import require_text
 from .text_utils import normalize_whitespace, truncate
@@ -48,7 +49,13 @@ def fuse_frame_captions(
     results: list[dict] = []
 
     initial_captions = initial_captions or {}
-    for fe in frame_evidence:
+    for fe in progress_iter(
+        frame_evidence,
+        total=len(frame_evidence),
+        desc="Phase 2 frame captions",
+        logger=logger,
+        item_label=lambda fe: fe.get("canonical_frame_id", ""),
+    ):
         frame_id = fe["canonical_frame_id"]
         input_signature = stable_input_signature({
             "frame_evidence": fe,

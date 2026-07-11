@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from .config import PipelineConfig
+from .progress import progress_iter
 from .runtime import JsonlCheckpoint, TextLLMRuntime, stable_input_signature
 from .runtime.json_output import optional_text, require_text
 from .text_utils import normalize_whitespace, truncate
@@ -31,7 +32,13 @@ def fuse_shot_captions(
     results: list[dict] = []
     memory_before = ""
 
-    for idx, shot in enumerate(shot_evidence):
+    for idx, shot in progress_iter(
+        enumerate(shot_evidence),
+        total=len(shot_evidence),
+        desc="Phase 3 shot captions",
+        logger=logger,
+        item_label=lambda item: item[1].get("shot_id", ""),
+    ):
         shot_id = shot["shot_id"]
         rep_input = {
             frame_id: (frame_map.get(frame_id) or {}).get("caption_text", "") or ""

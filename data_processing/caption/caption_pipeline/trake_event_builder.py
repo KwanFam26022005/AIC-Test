@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from .config import PipelineConfig
+from .progress import progress_iter
 from .runtime import JsonlCheckpoint, TextLLMRuntime, stable_input_signature
 from .runtime.json_output import (
     enum_value,
@@ -59,7 +60,13 @@ def build_trake_event_steps(
     mode = cfg.trake_event.event_mode
     results: list[dict] = []
 
-    for idx, shot in enumerate(shots):
+    for idx, shot in progress_iter(
+        enumerate(shots),
+        total=len(shots),
+        desc="Phase 4 TRAKE events",
+        logger=logger,
+        item_label=lambda item: item[1].get("shot_id", ""),
+    ):
         shot_id = shot["shot_id"]
         prev_shot = shots[idx - 1] if idx > 0 else None
         next_shot = shots[idx + 1] if idx < len(shots) - 1 else None

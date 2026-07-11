@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .io_utils import read_jsonl, utc_now_iso, write_json, write_jsonl
+from .progress import progress_iter
 from .runtime.env_loader import expand_env_values, load_env_file
 from .text_utils import normalize_whitespace, truncate
 
@@ -89,7 +90,13 @@ def run_vlm_frame_experiment(cfg: dict[str, Any]) -> dict[str, Any]:
         "VLM frame experiment: %s/%s selected=%d existing=%d shard=%d/%d",
         experiment_name, video_id, len(selected), len(existing), shard_index, num_shards,
     )
-    for doc in selected:
+    for doc in progress_iter(
+        selected,
+        total=len(selected),
+        desc="VLM frame captions",
+        logger=logger,
+        item_label=lambda doc: doc.get("canonical_frame_id") or doc.get("frame_id", ""),
+    ):
         frame_id = doc.get("canonical_frame_id") or doc.get("frame_id")
         if not frame_id or frame_id in done_ids:
             continue
