@@ -54,6 +54,22 @@ Script tạo:
 
 Khi dùng `--frame-id`, script tự đọc `<ocr-root>/<video-id>/<video-id>_ocr_es_docs.jsonl`, tìm đúng frame, rồi chọn một OCR line bbox đại diện. Mặc định nó ưu tiên line từng được đánh dấu `send_to_vintern` hoặc `need_review`; nếu không có thì chọn line có score thấp/text dài/vùng lớn. Muốn đổi candidate trong cùng frame, tăng `--candidate-index 1`, `--candidate-index 2`, ...
 
+Muốn chạy nhiều bbox trong cùng frame:
+
+```bash
+# Chạy top 5 OCR boxes, bắt đầu từ candidate 0.
+--max-candidates 5
+
+# Chạy toàn bộ OCR boxes trong frame.
+--all-candidates
+```
+
+Khi chạy nhiều bbox, output sẽ có thêm:
+
+- `candidate_000_<line_id>/`, `candidate_001_<line_id>/`, ...: kết quả từng bbox.
+- `result_all.json`: kết quả tổng hợp.
+- `summary_all.html`: bảng so sánh tổng hợp.
+
 - Nếu `full_coord` sai nhưng `crop_expanded` đúng: Vintern đọc chữ được, nhưng coordinate grounding yếu hoặc bị ảnh hưởng resize/tile.
 - Nếu `full_box` đúng hơn `full_coord`: model bám visual marker tốt hơn tọa độ số.
 - Nếu cả ba đều sai: vùng chữ quá mờ/nhỏ, bbox sai, hoặc model không đủ OCR năng lực cho case đó.

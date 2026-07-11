@@ -146,6 +146,17 @@ def pick_ocr_line(doc: dict[str, Any], candidate_index: int) -> dict[str, Any]:
     return ranked[candidate_index]
 
 
+def line_text_hint(line: dict[str, Any] | None) -> str:
+    if not line:
+        return ""
+    return (
+        line.get("final_text")
+        or line.get("vietocr_text")
+        or line.get("vintern_text")
+        or ""
+    )
+
+
 def parse_bbox(raw: str) -> tuple[int, int, int, int]:
     parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
     if len(parts) != 4:
@@ -334,6 +345,109 @@ def write_html(result: dict[str, Any], output_dir: Path) -> None:
     (output_dir / "summary.html").write_text(html_text, encoding="utf-8")
 
 
+def write_all_html(results: list[dict[str, Any]], output_dir: Path) -> None:
+    rows = []
+    for result in results:
+        candidate_dir = html.escape(result["candidate_dir"])
+        cases = result.get("cases", {})
+        response_cells = []
+        for case_name in ("full_coord", "full_box", "crop_expanded"):
+            response = cases.get(case_name, {}).get("response", "")
+            response_cells.append(f"<td><pre>{html.escape(response)}</pre></td>")
+        rows.append(
+            "<tr>"
+            f"<td>{result['candidate_index']}</td>"
+            f"<td>{html.escape(str(result.get('line_id')))}</td>"
+            f"<td>{html.escape(str(result['bbox']))}</td>"
+            f"<td>{html.escape(str(result.get('ocr_text_hint', '')))}</td>"
+            f"<td><a href=\"{candidate_dir}/summary.html\">open</a></td>"
+            + "".join(response_cells)
+            + "</tr>"
+        )
+    html_text = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Vintern Grounding Demo - All Candidates</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 24px; color: #102033; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 14px; }}
+    th, td {{ border: 1px solid #d6e0ea; padding: 8px; vertical-align: top; }}
+    th {{ background: #eef4fb; text-align: left; position: sticky; top: 0; }}
+    pre {{ white-space: pre-wrap; margin: 0; max-width: 360px; }}
+  </style>
+</head>
+<body>
+  <h1>Vintern Grounding Demo - All Candidates</h1>
+  <p>Total candidates: {len(results)}</p>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th><th>Line</th><th>BBox</th><th>OCR Hint</th><th>Detail</th>
+        <th>Full Coord</th><th>Full Box</th><th>Crop Expanded</th>
+      </tr>
+    </thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</body>
+</html>
+"""
+    (output_dir / "summary_all.html").write_text(html_text, encoding="utf-8")
+
+
+def prepare_candidate_artifacts(
+    *,
+    image: Image.Image,
+    image_path: Path,
+    bbox: tuple[int, int, int, int],
+    ocr_text: str,
+    output_dir: Path,
+    candidate_index: int,
+    line: dict[str, Any] | None,
+    padding_ratio: float,
+    min_padding: int,
+) -> dict[str, Any]:
+    width, height = image.size
+    safe_bbox = clamp_bbox(bbox, width, height)
+    expanded = expand_bbox(safe_bbox, width, height, padding_ratio, min_padding)
+    label = f"TARGET {candidate_index}"
+    full_with_box = draw_bbox(image, safe_bbox, label)
+    crop = image.crop(expanded)
+
+    full_path = output_dir / "source.jpg"
+    boxed_path = output_dir / "full_with_box.jpg"
+    crop_path = output_dir / "crop_expanded.jpg"
+    save_image(image, full_path)
+    save_image(full_with_box, boxed_path)
+    save_image(crop, crop_path)
+
+    return {
+        "candidate_index": candidate_index,
+        "line_id": line.get("line_id") if line else None,
+        "image": str(image_path),
+        "image_size": [width, height],
+        "bbox": list(safe_bbox),
+        "expanded_bbox": list(expanded),
+        "ocr_text_hint": ocr_text,
+        "candidate_dir": output_dir.name,
+        "paths": {
+            "source": str(full_path),
+            "full_with_box": str(boxed_path),
+            "crop_expanded": str(crop_path),
+        },
+        "line": {
+            "line_id": line.get("line_id"),
+            "group_id": line.get("group_id"),
+            "final_text": line.get("final_text"),
+            "vietocr_text": line.get("vietocr_text"),
+            "vintern_text": line.get("vintern_text"),
+            "composite_score": line.get("composite_score"),
+            "send_to_vintern": line.get("send_to_vintern"),
+            "need_review": line.get("need_review"),
+        } if line else None,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Test Vintern coordinate grounding on one frame.")
     parser.add_argument("--image", type=Path, help="Path to the source frame image. Optional when --frame-id is used.")
@@ -344,6 +458,8 @@ def main() -> int:
     parser.add_argument("--ocr-root", type=Path, help="OCR output root. Default: <repo>/outputs/ocr_vlm_pipeline_v2.")
     parser.add_argument("--frames-root", type=Path, help="Frames root used to resolve image_relpath. Default: <repo>/keyframe_test.")
     parser.add_argument("--candidate-index", type=int, default=0, help="Ranked OCR line candidate index within the frame.")
+    parser.add_argument("--max-candidates", type=int, default=1, help="Number of ranked OCR boxes to test from --candidate-index.")
+    parser.add_argument("--all-candidates", action="store_true", help="Test all OCR boxes in the selected frame.")
     parser.add_argument("--dry-run", action="store_true", help="Resolve OCR bbox and write crop/box artifacts without loading Vintern.")
     parser.add_argument("--ocr-text", default=None, help="Optional existing/wrong OCR text hint. Defaults to selected OCR line text.")
     parser.add_argument("--model-id", default="5CD-AI/Vintern-3B-beta", help="HF model id.")
@@ -370,27 +486,40 @@ def main() -> int:
     if args.image is not None and not args.image.exists():
         raise FileNotFoundError(args.image)
 
-    if args.frame_id and (args.image is None or args.bbox is None):
+    selected_lines: list[tuple[int, dict[str, Any]]] = []
+    selected_doc: dict[str, Any] | None = None
+
+    if args.frame_id and (args.image is None or args.bbox is None or args.all_candidates or args.max_candidates != 1):
         video_id = args.video_id or infer_video_id(args.frame_id)
         if not video_id:
             raise ValueError("--video-id is required when it cannot be inferred from --frame-id")
         ocr_jsonl = resolve_ocr_jsonl(REPO_ROOT, video_id, args.ocr_root, args.ocr_jsonl)
         LOGGER.info("Reading OCR output: %s", ocr_jsonl)
-        doc = find_ocr_doc(read_jsonl(ocr_jsonl), args.frame_id)
-        line = pick_ocr_line(doc, args.candidate_index)
+        selected_doc = find_ocr_doc(read_jsonl(ocr_jsonl), args.frame_id)
+        ranked_lines = ranked_ocr_lines(selected_doc)
+        if args.candidate_index < 0 or args.candidate_index >= len(ranked_lines):
+            raise IndexError(
+                f"--candidate-index {args.candidate_index} out of range; "
+                f"frame has {len(ranked_lines)} candidates."
+            )
+        if args.all_candidates:
+            count = len(ranked_lines) - args.candidate_index
+        else:
+            count = max(1, args.max_candidates)
+        selected_lines = list(enumerate(
+            ranked_lines[args.candidate_index:args.candidate_index + count],
+            start=args.candidate_index,
+        ))
+        line = selected_lines[0][1]
         if args.image is None:
-            args.image = resolve_image_from_doc(doc, args.frames_root or (REPO_ROOT / "keyframe_test"))
+            args.image = resolve_image_from_doc(selected_doc, args.frames_root or (REPO_ROOT / "keyframe_test"))
         if args.bbox is None:
             args.bbox = parse_bbox(",".join(str(v) for v in line["bbox_xyxy"]))
         if args.ocr_text is None:
-            args.ocr_text = (
-                line.get("final_text")
-                or line.get("vietocr_text")
-                or line.get("vintern_text")
-                or ""
-            )
+            args.ocr_text = line_text_hint(line)
         LOGGER.info(
-            "Selected OCR line: line_id=%s bbox=%s text=%r score=%s send_to_vintern=%s need_review=%s",
+            "Selected %d OCR candidate(s), first line_id=%s bbox=%s text=%r score=%s send_to_vintern=%s need_review=%s",
+            len(selected_lines),
             line.get("line_id"),
             args.bbox,
             args.ocr_text,
@@ -406,33 +535,56 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     image = Image.open(args.image).convert("RGB")
-    width, height = image.size
-    bbox = clamp_bbox(args.bbox, width, height)
-    expanded = expand_bbox(bbox, width, height, args.padding_ratio, args.min_padding)
+    if not selected_lines:
+        selected_lines = [(
+            args.candidate_index,
+            {
+                "line_id": "manual",
+                "bbox_xyxy": list(args.bbox),
+                "final_text": args.ocr_text,
+            },
+        )]
 
-    full_with_box = draw_bbox(image, bbox, "TARGET")
-    crop = image.crop(expanded)
-    full_path = args.output_dir / "source.jpg"
-    boxed_path = args.output_dir / "full_with_box.jpg"
-    crop_path = args.output_dir / "crop_expanded.jpg"
-    save_image(image, full_path)
-    save_image(full_with_box, boxed_path)
-    save_image(crop, crop_path)
+    candidate_specs = []
+    for candidate_index, line in selected_lines:
+        bbox = parse_bbox(",".join(str(v) for v in line["bbox_xyxy"]))
+        ocr_text = args.ocr_text if len(selected_lines) == 1 and args.ocr_text else line_text_hint(line)
+        candidate_dir = args.output_dir
+        if len(selected_lines) > 1:
+            candidate_dir = args.output_dir / f"candidate_{candidate_index:03d}_{line.get('line_id') or 'line'}"
+        candidate_dir.mkdir(parents=True, exist_ok=True)
+        candidate_specs.append({
+            "candidate_index": candidate_index,
+            "line": line,
+            "bbox": bbox,
+            "ocr_text": ocr_text,
+            "output_dir": candidate_dir,
+        })
 
     if args.dry_run:
-        dry_result = {
-            "image": str(args.image),
-            "image_size": [width, height],
-            "bbox": list(bbox),
-            "expanded_bbox": list(expanded),
-            "ocr_text_hint": args.ocr_text,
-            "note": "dry_run_only_no_vintern_loaded",
-        }
-        dry_path = args.output_dir / "selected_region.json"
-        dry_path.write_text(json.dumps(dry_result, ensure_ascii=False, indent=2), encoding="utf-8")
-        LOGGER.info("Dry run wrote selected region -> %s", dry_path)
-        LOGGER.info("Dry run wrote full frame with box -> %s", boxed_path)
-        LOGGER.info("Dry run wrote expanded crop -> %s", crop_path)
+        dry_results = []
+        for spec in candidate_specs:
+            dry_result = prepare_candidate_artifacts(
+                image=image,
+                image_path=args.image,
+                bbox=spec["bbox"],
+                ocr_text=spec["ocr_text"],
+                output_dir=spec["output_dir"],
+                candidate_index=spec["candidate_index"],
+                line=spec["line"],
+                padding_ratio=args.padding_ratio,
+                min_padding=args.min_padding,
+            )
+            dry_result["note"] = "dry_run_only_no_vintern_loaded"
+            dry_path = spec["output_dir"] / "selected_region.json"
+            dry_path.write_text(json.dumps(dry_result, ensure_ascii=False, indent=2), encoding="utf-8")
+            dry_results.append(dry_result)
+        if len(dry_results) > 1:
+            all_path = args.output_dir / "selected_regions_all.json"
+            all_path.write_text(json.dumps(dry_results, ensure_ascii=False, indent=2), encoding="utf-8")
+            LOGGER.info("Dry run wrote %d selected regions -> %s", len(dry_results), all_path)
+        else:
+            LOGGER.info("Dry run wrote selected region -> %s", candidate_specs[0]["output_dir"] / "selected_region.json")
         return 0
 
     cfg = make_config(
@@ -447,52 +599,78 @@ def main() -> int:
 
     LOGGER.info("Loading model: %s", args.model_id)
     model, tokenizer = load_vintern_model(cfg)
-    prompts = build_prompts(bbox, args.ocr_text, args.language)
+    results = []
+    total = len(candidate_specs)
+    for pos, spec in enumerate(candidate_specs, start=1):
+        LOGGER.info(
+            "[%d/%d] Running candidate=%s line_id=%s bbox=%s",
+            pos,
+            total,
+            spec["candidate_index"],
+            spec["line"].get("line_id"),
+            spec["bbox"],
+        )
+        base = prepare_candidate_artifacts(
+            image=image,
+            image_path=args.image,
+            bbox=spec["bbox"],
+            ocr_text=spec["ocr_text"],
+            output_dir=spec["output_dir"],
+            candidate_index=spec["candidate_index"],
+            line=spec["line"],
+            padding_ratio=args.padding_ratio,
+            min_padding=args.min_padding,
+        )
+        prompts = build_prompts(tuple(base["bbox"]), spec["ocr_text"], args.language)
+        paths = base["paths"]
+        cases = {
+            "full_coord": run_case(
+                model=model,
+                tokenizer=tokenizer,
+                image_path=Path(paths["source"]),
+                prompt=prompts["full_coord"],
+                cfg=cfg,
+                max_tiles=args.full_max_tiles,
+            ),
+            "full_box": run_case(
+                model=model,
+                tokenizer=tokenizer,
+                image_path=Path(paths["full_with_box"]),
+                prompt=prompts["full_box"],
+                cfg=cfg,
+                max_tiles=args.full_max_tiles,
+            ),
+            "crop_expanded": run_case(
+                model=model,
+                tokenizer=tokenizer,
+                image_path=Path(paths["crop_expanded"]),
+                prompt=prompts["crop_expanded"],
+                cfg=cfg,
+                max_tiles=args.crop_max_tiles,
+            ),
+        }
 
-    cases = {
-        "full_coord": run_case(
-            model=model,
-            tokenizer=tokenizer,
-            image_path=full_path,
-            prompt=prompts["full_coord"],
-            cfg=cfg,
-            max_tiles=args.full_max_tiles,
-        ),
-        "full_box": run_case(
-            model=model,
-            tokenizer=tokenizer,
-            image_path=boxed_path,
-            prompt=prompts["full_box"],
-            cfg=cfg,
-            max_tiles=args.full_max_tiles,
-        ),
-        "crop_expanded": run_case(
-            model=model,
-            tokenizer=tokenizer,
-            image_path=crop_path,
-            prompt=prompts["crop_expanded"],
-            cfg=cfg,
-            max_tiles=args.crop_max_tiles,
-        ),
-    }
+        result = {
+            **base,
+            "model_id": args.model_id,
+            "device": str(next(model.parameters()).device),
+            "cases": cases,
+        }
+        result_path = spec["output_dir"] / "result.json"
+        result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_html(result, spec["output_dir"])
+        results.append(result)
 
-    result = {
-        "image": str(args.image),
-        "image_size": [width, height],
-        "bbox": list(bbox),
-        "expanded_bbox": list(expanded),
-        "model_id": args.model_id,
-        "device": str(next(model.parameters()).device),
-        "cases": cases,
-    }
-    result_path = args.output_dir / "result.json"
-    result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_html(result, args.output_dir)
+        LOGGER.info("Wrote candidate result JSON -> %s", result_path)
+        for name, case in cases.items():
+            LOGGER.info("%s candidate=%s: %s", name, spec["candidate_index"], case["response"].replace("\n", " ")[:240])
 
-    LOGGER.info("Wrote result JSON -> %s", result_path)
-    LOGGER.info("Wrote HTML summary -> %s", args.output_dir / "summary.html")
-    for name, case in cases.items():
-        LOGGER.info("%s: %s", name, case["response"].replace("\n", " ")[:240])
+    if len(results) > 1:
+        all_path = args.output_dir / "result_all.json"
+        all_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_all_html(results, args.output_dir)
+        LOGGER.info("Wrote all-candidate result JSON -> %s", all_path)
+        LOGGER.info("Wrote all-candidate HTML summary -> %s", args.output_dir / "summary_all.html")
     return 0
 
 
