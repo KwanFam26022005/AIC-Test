@@ -16,7 +16,7 @@ logger = logging.getLogger("caption_visualize")
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build a self-contained HTML visualization for one caption run.",
+        description="Build frame and shot review HTML pages for one caption run.",
     )
     parser.add_argument("--video-id", required=True, help="Video identifier, e.g. L22_V012")
     parser.add_argument(
@@ -27,7 +27,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-html",
         default="",
-        help="Optional output HTML path. Defaults to <caption-dir>/<video_id>/reports/caption_pipeline_visualization.html",
+        help="Optional index HTML path. Defaults to <caption-dir>/<video_id>/reports/visualization/index.html",
     )
     parser.add_argument(
         "--keyframes-root",
@@ -43,10 +43,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--image-mode",
         choices=("embed", "copy", "link"),
-        default="embed",
+        default="copy",
         help=(
-            "How images are packaged: embed creates a portable HTML, copy writes "
-            "a sibling assets folder, and link references the original files."
+            "How images are packaged: copy writes a reusable assets folder, embed "
+            "creates portable but heavier HTML, and link references original files."
         ),
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
