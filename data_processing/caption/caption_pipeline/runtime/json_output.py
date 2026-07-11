@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any, Callable
 
 
@@ -72,8 +73,11 @@ def enum_value(
     field: str,
     allowed: set[str],
     default: str = "unknown",
+    aliases: Mapping[str, str] | None = None,
 ) -> str:
     value = str(payload.get(field, default) or default).strip().lower()
+    if aliases:
+        value = aliases.get(value, value)
     if value not in allowed:
         raise ValueError(f"Field '{field}' has invalid value: {value}")
     return value

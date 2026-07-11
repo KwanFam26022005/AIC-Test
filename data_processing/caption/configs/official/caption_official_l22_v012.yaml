@@ -34,6 +34,7 @@ generation:
   vlm_prompt_version: qwen25vl_initial_caption_v1
   vlm_max_new_tokens: 96
   vlm_write_every: 20
+  shot_max_new_tokens: 512
   max_fallback_rate: 0.15
 
 retrieval:

@@ -238,7 +238,7 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
                 "CAPTION_FRAME_MAX_NEW_TOKENS", 128,
             ),
             shot_max_new_tokens=args.shot_max_new_tokens or _env_int(
-                "CAPTION_SHOT_MAX_NEW_TOKENS", 256,
+                "CAPTION_SHOT_MAX_NEW_TOKENS", 512,
             ),
             trake_max_new_tokens=args.trake_max_new_tokens or _env_int(
                 "CAPTION_TRAKE_MAX_NEW_TOKENS", 384,

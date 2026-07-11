@@ -74,7 +74,17 @@ class TextLLMRuntime:
         raw_output = ""
         prompt = rendered.text
         for attempt in range(1, self.config.max_retries + 2):
-            raw_output = self._generate(prompt, max_new_tokens=max_new_tokens)
+            # A valid object can be cut off when a verbose answer reaches the
+            # configured limit. Increase only retry budgets so normal rows keep
+            # their original cost while truncated rows have room to finish.
+            attempt_max_new_tokens = min(
+                int(max_new_tokens) * (2 ** (attempt - 1)),
+                2048,
+            )
+            raw_output = self._generate(
+                prompt,
+                max_new_tokens=attempt_max_new_tokens,
+            )
             try:
                 data = parse_json_object(
                     raw_output,
@@ -90,10 +100,20 @@ class TextLLMRuntime:
                 )
             except Exception as exc:
                 last_error = exc
-                logger.warning("%s JSON attempt %d failed: %s", task, attempt, exc)
+                logger.warning(
+                    "%s JSON attempt %d failed at max_new_tokens=%d: %s; "
+                    "output_tail=%r",
+                    task,
+                    attempt,
+                    attempt_max_new_tokens,
+                    exc,
+                    raw_output[-400:],
+                )
                 prompt = (
                     rendered.text
-                    + "\n\nYour previous response was invalid. Return one valid JSON object only."
+                    + "\n\nYour previous response was invalid or incomplete. "
+                    + "Regenerate the complete answer from the evidence above. "
+                    + "Return exactly one valid JSON object, beginning with { and ending with }."
                     + f"\nValidation error: {exc}"
                     + f"\nPrevious response: {raw_output[:1200]}"
                 )
@@ -134,12 +154,23 @@ class TextLLMRuntime:
 
     def _generate(self, prompt: str, max_new_tokens: int) -> str:
         assert self.model is not None and self.tokenizer is not None and self.torch is not None
-        messages = [{"role": "user", "content": prompt}]
+        messages = [
+            {
+                "role": "system",
+                "content": "Return exactly one valid JSON object and no other text.",
+            },
+            {"role": "user", "content": prompt},
+        ]
         chat_text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
         )
+        # Qwen follows structured output much more reliably when the assistant
+        # turn is prefixed with the opening delimiter. The prefix is part of the
+        # input, so add it back to the decoded continuation below.
+        json_prefix = "{"
+        chat_text += json_prefix
         inputs = self.tokenizer(
             chat_text,
             return_tensors="pt",
@@ -160,7 +191,11 @@ class TextLLMRuntime:
             generated = self.model.generate(**inputs, **generation)
         prompt_length = inputs["input_ids"].shape[1]
         new_tokens = generated[0, prompt_length:]
-        return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        continuation = self.tokenizer.decode(
+            new_tokens,
+            skip_special_tokens=True,
+        ).strip()
+        return (json_prefix + continuation).strip()
 
 
 def _mock_payload(task: str, values: dict[str, Any]) -> dict[str, Any]:

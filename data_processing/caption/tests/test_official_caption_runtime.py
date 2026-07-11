@@ -5,11 +5,13 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from caption_pipeline.config import PipelineConfig
 from caption_pipeline.frame_caption_fuser import fuse_frame_captions
 from caption_pipeline.runtime import JsonlCheckpoint, TextLLMRuntime
-from caption_pipeline.runtime.json_output import parse_json_object
+from caption_pipeline.runtime.json_output import enum_value, parse_json_object
 from caption_pipeline.shot_captioner import fuse_shot_captions
 from caption_pipeline.trake_event_builder import build_trake_event_steps
 
@@ -33,6 +35,66 @@ class OfficialRuntimeTests(unittest.TestCase):
             required_fields=("caption_text",),
         )
         self.assertEqual(result["caption_text"], "A presenter.")
+
+    def test_temporal_transition_alias_normalizes_to_change(self) -> None:
+        value = enum_value(
+            {"temporal_role": "transition"},
+            "temporal_role",
+            {"beginning", "continuation", "change", "completion", "unknown"},
+            aliases={"transition": "change"},
+        )
+        self.assertEqual(value, "change")
+
+    def test_runtime_expands_retry_budget_after_truncated_json(self) -> None:
+        runtime = TextLLMRuntime.__new__(TextLLMRuntime)
+        runtime.provider = "transformers"
+        runtime.model_name = "test-model"
+        runtime.prompt_version = "test-v1"
+        runtime.config = SimpleNamespace(max_retries=2)
+        runtime.prompts = self.runtime.prompts
+
+        outputs = [
+            '{"caption_text": "A presenter",',
+            (
+                '{"caption_text": "A presenter", '
+                '"temporal_caption": "Then, a presenter appears", '
+                '"memory_after": "presenter"}'
+            ),
+        ]
+        budgets: list[int] = []
+
+        def fake_generate(_prompt: str, max_new_tokens: int) -> str:
+            budgets.append(max_new_tokens)
+            return outputs.pop(0)
+
+        with patch.object(runtime, "_generate", side_effect=fake_generate):
+            outcome = runtime.generate_task(
+                "shot",
+                {
+                    "shot_id": "shot_1",
+                    "start_sec": 0,
+                    "end_sec": 1,
+                    "temporal_position": "Then,",
+                    "representative_frame_captions": "[]",
+                    "object_text": "",
+                    "scene_text": "studio",
+                    "ocr_text": "",
+                    "audio_text": "",
+                    "memory_before": "",
+                    "max_caption_chars": 520,
+                    "max_temporal_caption_chars": 620,
+                    "max_memory_chars": 500,
+                },
+                required_fields=(
+                    "caption_text",
+                    "temporal_caption",
+                    "memory_after",
+                ),
+                max_new_tokens=256,
+            )
+
+        self.assertEqual(outcome.attempts, 2)
+        self.assertEqual(budgets, [256, 512])
 
     def test_mock_runtime_runs_all_three_caption_levels(self) -> None:
         frame_evidence = [{

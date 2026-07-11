@@ -118,6 +118,9 @@ def main(argv: list[str] | None = None) -> int:
             "--prompt-version", generation.get(
                 "prompt_version", "caption_qwen25_official_v1",
             ),
+            "--shot-max-new-tokens", str(
+                generation.get("shot_max_new_tokens", 512)
+            ),
             "--max-fallback-rate", str(generation.get("max_fallback_rate", 0.15)),
         ]
         if vlm_output.exists():

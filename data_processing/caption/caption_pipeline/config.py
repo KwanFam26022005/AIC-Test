@@ -88,7 +88,7 @@ class LLMRuntimeConfig:
     prompt_version: str = "caption_qwen25_official_v1"
     max_input_tokens: int = 4096
     frame_max_new_tokens: int = 128
-    shot_max_new_tokens: int = 256
+    shot_max_new_tokens: int = 512
     trake_max_new_tokens: int = 384
     do_sample: bool = False
     temperature: float = 0.0

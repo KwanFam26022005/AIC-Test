@@ -146,6 +146,11 @@ def _llm_event_step(
     }
     allowed_action_states = {"start", "middle", "end", "transition", "result", "unknown"}
     allowed_temporal_roles = {"beginning", "continuation", "change", "completion", "unknown"}
+    temporal_role_aliases = {
+        # Qwen occasionally copies the action-state label into the adjacent
+        # temporal-role field. Both labels represent the same scene change.
+        "transition": "change",
+    }
 
     def validate(payload: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -163,6 +168,7 @@ def _llm_event_step(
                 payload,
                 "temporal_role",
                 allowed_temporal_roles,
+                aliases=temporal_role_aliases,
             ),
             "actors": string_list(payload, "actors", 8),
             "actions": string_list(payload, "actions", 8),
