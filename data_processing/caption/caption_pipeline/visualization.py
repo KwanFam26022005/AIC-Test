@@ -167,8 +167,8 @@ def render_visualization_index_html(
     <p class="subtle">Source: {_escape(str(base_dir))} | images: {_escape(image_mode)}</p>
   </div>
   <nav class="top-links">
-    <a href="frame_review.html">Frame Review</a>
-    <a href="shot_review.html">Shot Review</a>
+    <a data-tab="frames" href="frame_review.html">Frames</a>
+    <a data-tab="shots" href="shot_review.html">Shots</a>
   </nav>
 </section>
 <section class="cards">{cards}</section>
@@ -223,8 +223,8 @@ def render_frame_review_html(
     <p class="subtle">Click a frame to inspect caption, shot mapping and feature evidence.</p>
   </div>
   <nav class="top-links">
-    <a href="index.html">Summary</a>
-    <a href="shot_review.html">Shot Review</a>
+    <a data-tab="frames" href="frame_review.html">Frames</a>
+    <a data-tab="shots" href="shot_review.html">Shots</a>
   </nav>
 </section>
 <section class="cards compact">{cards}</section>
@@ -279,8 +279,8 @@ def render_shot_review_html(
     <p class="subtle">A shot is a short time segment made from nearby frames and merged evidence.</p>
   </div>
   <nav class="top-links">
-    <a href="index.html">Summary</a>
-    <a href="frame_review.html">Frame Review</a>
+    <a data-tab="frames" href="frame_review.html">Frames</a>
+    <a data-tab="shots" href="shot_review.html">Shots</a>
   </nav>
 </section>
 <section class="cards compact">{cards}</section>
@@ -357,6 +357,12 @@ def _page(*, title: str, active: str, body: str) -> str:
       padding: 8px 11px;
       font-weight: 700;
     }}
+    body[data-active="frames"] .top-links a[data-tab="frames"],
+    body[data-active="shots"] .top-links a[data-tab="shots"] {{
+      background: var(--accent);
+      border-color: var(--accent);
+      color: white;
+    }}
     .cards {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -419,9 +425,11 @@ def _page(*, title: str, active: str, body: str) -> str:
       box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
       overflow: hidden;
     }}
-    .frame-card summary, .shot-card summary {{ cursor: pointer; list-style: none; }}
-    .frame-card summary::-webkit-details-marker, .shot-card summary::-webkit-details-marker {{ display: none; }}
-    .frame-card[open], .shot-card[open] {{ border-color: #9bb8ca; }}
+    .frame-card {{ display: flex; flex-direction: column; min-height: 100%; }}
+    .frame-card [data-open-dialog] {{ cursor: zoom-in; }}
+    .shot-card summary {{ cursor: pointer; list-style: none; }}
+    .shot-card summary::-webkit-details-marker {{ display: none; }}
+    .shot-card[open] {{ border-color: #9bb8ca; }}
     .image-wrap {{ position: relative; background: #e5ebf0; }}
     .image-wrap img {{
       width: 100%;
@@ -439,11 +447,17 @@ def _page(*, title: str, active: str, body: str) -> str:
       background: #e8edf1;
       word-break: break-word;
     }}
-    .frame-summary {{ padding: 10px 12px 12px; }}
+    .frame-summary {{ padding: 10px 12px 12px; flex: 1; }}
     .frame-title, .shot-title {{ display: flex; justify-content: space-between; gap: 10px; align-items: start; }}
     .frame-title b, .shot-title b {{ word-break: break-word; }}
     .time {{ color: var(--accent); font-weight: 800; white-space: nowrap; }}
     .caption {{ margin: 8px 0 0; color: #26394a; }}
+    .caption.clamp {{
+      display: -webkit-box;
+      -webkit-line-clamp: 4;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }}
     .chips {{ display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }}
     .chip {{
       display: inline-flex;
@@ -460,9 +474,34 @@ def _page(*, title: str, active: str, body: str) -> str:
     .chip.ocr {{ background: var(--violet-soft); color: #563d82; }}
     .chip.warn {{ background: var(--warn-soft); color: var(--warn); }}
     .chip.bad {{ background: var(--bad-soft); color: var(--bad); }}
+    .open-detail {{
+      width: calc(100% - 24px);
+      margin: 0 12px 12px;
+      min-height: 36px;
+      border: 1px solid var(--accent);
+      border-radius: 7px;
+      background: white;
+      color: var(--accent);
+      font: inherit;
+      font-weight: 800;
+      cursor: pointer;
+    }}
+    .open-detail:hover {{ background: var(--accent-soft); }}
     .detail {{ border-top: 1px solid var(--line); padding: 12px; }}
     .detail-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
-    .detail-grid.three {{ grid-template-columns: 1fr 1fr 1fr; }}
+    .detail-grid.three {{ grid-template-columns: 1fr 1fr; align-items: start; }}
+    .shot-detail {{
+      display: grid;
+      grid-template-columns: minmax(360px, 1.1fr) minmax(0, 1.4fr);
+      gap: 12px;
+      align-items: start;
+    }}
+    .shot-evidence-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      align-items: start;
+    }}
     .box {{ border: 1px solid var(--line); border-radius: 8px; padding: 11px; min-width: 0; background: #fbfdfe; }}
     .box.objects {{ border-top: 3px solid var(--accent); }}
     .box.scene {{ border-top: 3px solid var(--blue); }}
@@ -488,6 +527,47 @@ def _page(*, title: str, active: str, body: str) -> str:
       gap: 6px;
     }}
     .thumb-strip .image-wrap img, .thumb-strip .image-missing {{ border-radius: 6px; }}
+    .feature-dialog {{
+      width: min(1180px, 94vw);
+      max-height: 92vh;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0;
+      box-shadow: 0 24px 80px rgba(15, 23, 42, 0.28);
+    }}
+    .feature-dialog::backdrop {{ background: rgba(15, 23, 42, 0.42); }}
+    .dialog-head {{
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      background: white;
+      border-bottom: 1px solid var(--line);
+      padding: 12px 14px;
+    }}
+    .dialog-head h2 {{ margin: 0; font-size: 18px; }}
+    .dialog-close {{
+      min-width: 34px;
+      height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: white;
+      font: inherit;
+      font-weight: 900;
+      cursor: pointer;
+    }}
+    .dialog-body {{ padding: 14px; }}
+    .dialog-hero {{
+      display: grid;
+      grid-template-columns: minmax(360px, 0.95fr) minmax(0, 1.2fr);
+      gap: 14px;
+      align-items: start;
+      margin-bottom: 12px;
+    }}
+    .dialog-hero .image-wrap img, .dialog-hero .image-missing {{ border-radius: 8px; }}
     .metric-table {{ width: 100%; border-collapse: collapse; }}
     .metric-table th, .metric-table td {{ text-align: left; padding: 7px 8px; border-bottom: 1px solid #e9eef2; vertical-align: top; }}
     .metric-table th {{ width: 170px; color: var(--muted); font-weight: 700; }}
@@ -503,7 +583,7 @@ def _page(*, title: str, active: str, body: str) -> str:
     }}
     .hidden {{ display: none; }}
     @media (max-width: 1050px) {{
-      .hero, .toolbar, .review-choice, .shot-preview, .detail-grid, .detail-grid.three {{ grid-template-columns: 1fr; display: grid; }}
+      .hero, .toolbar, .review-choice, .shot-preview, .detail-grid, .detail-grid.three, .shot-detail, .shot-evidence-grid, .dialog-hero {{ grid-template-columns: 1fr; display: grid; }}
       .toolbar {{ position: static; }}
     }}
   </style>
@@ -535,6 +615,33 @@ function applyFilter() {{
 }}
 filter.addEventListener('input', applyFilter);
 featureFilter.addEventListener('change', applyFilter);
+document.addEventListener('click', (event) => {{
+  const opener = event.target.closest('[data-open-dialog]');
+  if (opener) {{
+    const dialog = document.getElementById(opener.dataset.openDialog);
+    if (dialog) {{
+      if (dialog.showModal) dialog.showModal();
+      else dialog.setAttribute('open', '');
+    }}
+  }}
+  const closer = event.target.closest('[data-close-dialog]');
+  if (closer) {{
+    const dialog = closer.closest('dialog');
+    if (dialog && dialog.close) dialog.close();
+    else if (dialog) dialog.removeAttribute('open');
+  }}
+  if (event.target.matches('dialog.feature-dialog')) {{
+    if (event.target.close) event.target.close();
+    else event.target.removeAttribute('open');
+  }}
+}});
+document.addEventListener('keydown', (event) => {{
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  const opener = event.target.closest('[data-open-dialog]');
+  if (!opener) return;
+  event.preventDefault();
+  opener.click();
+}});
 applyFilter();
 </script>"""
 
@@ -768,8 +875,9 @@ def _render_frame_card(
         ("Caption mode", quality.get("caption_mode")),
         ("Warnings", "; ".join(map(str, quality.get("warnings") or []))),
     ])
-    return f"""<details class="frame-card" data-search="{_escape_attr(search_text)}" data-features="{_escape_attr(features)}">
-  <summary>
+    dialog_id = f"frame-{_safe_asset_name(frame_id)}"
+    return f"""<article class="frame-card" data-search="{_escape_attr(search_text)}" data-features="{_escape_attr(features)}">
+  <div role="button" tabindex="0" data-open-dialog="{_escape_attr(dialog_id)}">
     {image}
     <div class="frame-summary">
       <div class="frame-title">
@@ -777,13 +885,30 @@ def _render_frame_card(
         <span class="time">{_fmt_time(frame.get("timestamp_sec"))}</span>
       </div>
       <div class="chips">{''.join(_chip(label, cls) for label, cls in chips)}</div>
-      <p class="caption">{_value(frame.get("caption_text"))}</p>
+      <p class="caption clamp">{_value(frame.get("caption_text"))}</p>
     </div>
-  </summary>
-  <div class="detail">
-    <div class="detail-grid">
+  </div>
+  <button class="open-detail" type="button" data-open-dialog="{_escape_attr(dialog_id)}">Open frame detail</button>
+</article>
+<dialog class="feature-dialog" id="{_escape_attr(dialog_id)}">
+  <div class="dialog-head">
+    <div>
+      <h2>{_escape(frame_id)}</h2>
+      <div class="subtle">{_escape(str(shot.get("shot_id") or "no-shot"))} | {_fmt_time(frame.get("timestamp_sec"))}</div>
+    </div>
+    <button class="dialog-close" type="button" data-close-dialog>x</button>
+  </div>
+  <div class="dialog-body">
+    <div class="dialog-hero">
+      {image}
+      <section class="box">
+        <h3>Caption</h3>
+        <p>{_value(frame.get("caption_text"))}</p>
+        <div class="chips">{''.join(_chip(label, cls) for label, cls in chips)}</div>
+      </section>
+    </div>
+    <div class="detail-grid three">
       <section class="box"><h3>Frame Mapping</h3>{mapping_table}</section>
-      <section class="box"><h3>Caption</h3><p>{_value(frame.get("caption_text"))}</p></section>
       <section class="box objects"><h3>Objects</h3>{_tags(_object_items(obj), "object")}</section>
       <section class="box scene"><h3>Scene / RAM</h3>{_tags((obj.get("scene_tags") or []) + (obj.get("ram_tags") or []))}</section>
       <section class="box ocr"><h3>OCR</h3><p>{_value(ocr.get("ocr_text"))}</p></section>
@@ -791,7 +916,7 @@ def _render_frame_card(
     </div>
     <details class="raw"><summary>Raw frame evidence</summary><pre>{_escape(json.dumps(raw, ensure_ascii=False, indent=2))}</pre></details>
   </div>
-</details>"""
+</dialog>"""
 
 
 def _render_shot_card(
@@ -887,13 +1012,15 @@ def _render_shot_card(
     </div>
   </summary>
   <div class="detail">
-    <div class="detail-grid three">
+    <div class="shot-detail">
       <section class="box event"><h3>Event / TRAKE</h3>{_render_event_detail(event)}</section>
-      <section class="box objects"><h3>Objects</h3>{_tags(object_items, "object")}</section>
-      <section class="box scene"><h3>Scene / RAM</h3>{_tags(scene_tags)}</section>
-      <section class="box ocr"><h3>OCR</h3><p>{_value(ocr_text)}</p></section>
-      <section class="box audio"><h3>Audio / ASR</h3><p>{_value(audio_text)}</p></section>
-      <section class="box"><h3>Search / Quality</h3>{quality_table}</section>
+      <div class="shot-evidence-grid">
+        <section class="box objects"><h3>Objects</h3>{_tags(object_items, "object")}</section>
+        <section class="box scene"><h3>Scene / RAM</h3>{_tags(scene_tags)}</section>
+        <section class="box ocr"><h3>OCR</h3><p>{_value(ocr_text)}</p></section>
+        <section class="box audio"><h3>Audio / ASR</h3><p>{_value(audio_text)}</p></section>
+        <section class="box"><h3>Search / Quality</h3>{quality_table}</section>
+      </div>
     </div>
     <details class="raw"><summary>Raw shot and event JSON</summary><pre>{_escape(json.dumps(raw, ensure_ascii=False, indent=2))}</pre></details>
   </div>

@@ -193,7 +193,10 @@ class CaptionVisualizationTests(unittest.TestCase):
 
             self.assertTrue(index_path.exists())
             self.assertIn('<img src="assets/L22_V012_001.jpg"', frame_html)
+            self.assertIn('class="feature-dialog"', frame_html)
+            self.assertIn("Open frame detail", frame_html)
             self.assertIn('<img src="assets/L22_V012_001.jpg"', shot_html)
+            self.assertIn('class="shot-detail"', shot_html)
             self.assertTrue((index_path.parent / "assets" / "L22_V012_001.jpg").exists())
 
 
