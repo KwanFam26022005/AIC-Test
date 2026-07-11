@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import html
 import json
+import mimetypes
+import shutil
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -18,8 +21,11 @@ def write_caption_visualization(
     output_html: str | Path | None = None,
     keyframes_root: str | Path | None = None,
     max_frames_per_shot: int = 3,
+    image_mode: str = "embed",
 ) -> Path:
     """Write an interactive HTML visualization for one caption output folder."""
+    if image_mode not in {"embed", "copy", "link"}:
+        raise ValueError("image_mode must be one of: embed, copy, link")
     base_dir = Path(caption_dir) / video_id
     if not base_dir.exists():
         raise FileNotFoundError(f"Caption video directory not found: {base_dir}")
@@ -34,6 +40,8 @@ def write_caption_visualization(
     shot_index = read_jsonl(paths["shot_index"])
     event_index = read_jsonl(paths["event_step_index"])
     compact_docs = read_jsonl(paths["compact_index"])
+    frame_evidence = read_jsonl(paths["frame_evidence"]) if paths["frame_evidence"].exists() else []
+    shot_evidence = read_jsonl(paths["shot_evidence"]) if paths["shot_evidence"].exists() else []
     reports = _read_reports(paths)
 
     if output_html is None:
@@ -48,10 +56,13 @@ def write_caption_visualization(
         shot_index=shot_index,
         event_index=event_index,
         compact_docs=compact_docs,
+        frame_evidence=frame_evidence,
+        shot_evidence=shot_evidence,
         reports=reports,
         output_path=output_path,
         keyframes_root=Path(keyframes_root) if keyframes_root else None,
         max_frames_per_shot=max_frames_per_shot,
+        image_mode=image_mode,
     )
     write_text(output_path, html_text)
     return output_path
@@ -65,10 +76,13 @@ def render_caption_visualization_html(
     shot_index: list[dict],
     event_index: list[dict],
     compact_docs: list[dict],
+    frame_evidence: list[dict],
+    shot_evidence: list[dict],
     reports: dict[str, Any],
     output_path: Path,
     keyframes_root: Path | None,
     max_frames_per_shot: int,
+    image_mode: str,
 ) -> str:
     """Render a self-contained HTML page."""
     frame_map = {
@@ -81,6 +95,15 @@ def render_caption_visualization_html(
         for row in event_index
         if row.get("shot_id")
     }
+    frame_evidence_map = {
+        row.get("canonical_frame_id") or row.get("frame_id"): row
+        for row in frame_evidence
+        if row.get("canonical_frame_id") or row.get("frame_id")
+    }
+    shot_evidence_map = {
+        row.get("shot_id"): row for row in shot_evidence if row.get("shot_id")
+    }
+    shot_frames = _frames_by_shot(shot_index, frame_index)
     summary = _build_summary(frame_index, shot_index, event_index, compact_docs, reports)
     cards = "\n".join(
         _summary_card(label, value, hint)
@@ -93,9 +116,13 @@ def render_caption_visualization_html(
             shot=shot,
             event=event_map.get(shot.get("shot_id")),
             frame_map=frame_map,
+            frame_evidence_map=frame_evidence_map,
+            shot_evidence=shot_evidence_map.get(shot.get("shot_id"), {}),
+            shot_frames=shot_frames.get(shot.get("shot_id"), []),
             output_path=output_path,
             keyframes_root=keyframes_root,
             max_frames=max_frames_per_shot,
+            image_mode=image_mode,
         )
         for shot in shot_index
     )
@@ -110,13 +137,17 @@ def render_caption_visualization_html(
   <style>
     :root {{
       color-scheme: light;
-      --bg: #f6f8fb;
+      --bg: #f3f6f8;
       --panel: #ffffff;
-      --ink: #1f2937;
-      --muted: #64748b;
-      --line: #d8dee9;
-      --accent: #0f766e;
-      --accent-soft: #dff5f1;
+      --ink: #15212b;
+      --muted: #627181;
+      --line: #d5dde3;
+      --accent: #087f76;
+      --accent-soft: #def4f1;
+      --blue: #1769aa;
+      --blue-soft: #e5f1fb;
+      --violet: #7051a6;
+      --violet-soft: #f0ebf8;
       --warn: #b45309;
       --warn-soft: #fff4d6;
       --bad: #b91c1c;
@@ -133,12 +164,12 @@ def render_caption_visualization_html(
     header {{
       position: sticky;
       top: 0;
-      z-index: 10;
-      background: rgba(246, 248, 251, 0.94);
+      z-index: 20;
+      background: rgba(243, 246, 248, 0.96);
       backdrop-filter: blur(8px);
       border-bottom: 1px solid var(--line);
     }}
-    .wrap {{ max-width: 1280px; margin: 0 auto; padding: 20px; }}
+    .wrap {{ max-width: 1480px; margin: 0 auto; padding: 18px 22px; }}
     h1 {{ margin: 0; font-size: 24px; letter-spacing: 0; }}
     h2 {{ margin: 28px 0 12px; font-size: 18px; letter-spacing: 0; }}
     .subtle {{ color: var(--muted); }}
@@ -171,7 +202,9 @@ def render_caption_visualization_html(
       border-radius: 8px;
       box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
     }}
-    .card {{ padding: 14px; }}
+    .card {{ padding: 14px; border-top: 3px solid var(--accent); }}
+    .card:nth-child(3n+2) {{ border-top-color: var(--blue); }}
+    .card:nth-child(3n) {{ border-top-color: var(--warn); }}
     .card .value {{ font-size: 24px; font-weight: 700; }}
     .card .label {{ color: var(--muted); font-size: 12px; text-transform: uppercase; }}
     .grid-2 {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }}
@@ -179,10 +212,10 @@ def render_caption_visualization_html(
     .mode-row {{ display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid #edf0f5; padding: 6px 0; }}
     .mode-row:last-child {{ border-bottom: 0; }}
     .timeline {{ display: flex; flex-direction: column; gap: 12px; }}
-    .shot {{ overflow: hidden; }}
+    .shot {{ overflow: hidden; scroll-margin-top: 150px; }}
     .shot-head {{
       display: grid;
-      grid-template-columns: 190px 1fr auto;
+      grid-template-columns: minmax(210px, .65fr) minmax(0, 1.7fr) auto;
       gap: 14px;
       align-items: start;
       padding: 14px;
@@ -205,15 +238,41 @@ def render_caption_visualization_html(
     }}
     .chip.warn {{ background: var(--warn-soft); color: var(--warn); }}
     .chip.bad {{ background: var(--bad-soft); color: var(--bad); }}
-    .body {{ display: grid; grid-template-columns: 1.3fr 1fr; gap: 14px; padding: 14px; }}
+    .shot-main {{ padding: 0 16px 16px; }}
+    .tabbar {{
+      display: flex;
+      gap: 4px;
+      overflow-x: auto;
+      padding: 10px 16px 0;
+      border-bottom: 1px solid var(--line);
+      background: #f8fafb;
+    }}
+    .tab-button {{
+      flex: 0 0 auto;
+      border: 0;
+      border-bottom: 3px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      padding: 9px 12px 8px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .tab-button.active {{ color: var(--accent); border-bottom-color: var(--accent); }}
+    .tab-pane {{ display: none; padding-top: 14px; }}
+    .tab-pane.active {{ display: block; }}
+    .overview-grid {{ display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(300px, .8fr); gap: 18px; }}
+    .caption-stack {{ border-left: 3px solid var(--blue); padding-left: 12px; }}
     .text-block {{ margin: 0 0 10px; }}
     .text-block b {{ display: block; margin-bottom: 3px; color: #0f172a; }}
-    .evidence {{
-      display: grid;
-      gap: 10px;
-      color: #334155;
-    }}
-    .thumbs {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-top: 10px; }}
+    .feature-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }}
+    .feature {{ background: white; padding: 13px; min-width: 0; }}
+    .feature h3 {{ margin: 0 0 8px; font-size: 13px; color: var(--muted); text-transform: uppercase; }}
+    .feature.ocr {{ border-top: 3px solid var(--violet); }}
+    .feature.audio {{ border-top: 3px solid var(--warn); }}
+    .feature.objects {{ border-top: 3px solid var(--accent); }}
+    .feature.scene {{ border-top: 3px solid var(--blue); }}
+    .thumbs {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }}
     .thumb {{
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -221,7 +280,21 @@ def render_caption_visualization_html(
       background: #f8fafc;
     }}
     .thumb img {{ width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; background: #e2e8f0; }}
-    .thumb .cap {{ padding: 7px; font-size: 12px; color: var(--muted); word-break: break-word; }}
+    .thumb .cap {{ padding: 8px; font-size: 12px; color: var(--muted); word-break: break-word; }}
+    .image-missing {{ aspect-ratio: 16/9; display: grid; place-items: center; padding: 14px; text-align: center; color: var(--muted); background: #e8edf1; }}
+    .frame-list {{ border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }}
+    .frame-row {{ display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 14px; padding: 12px; border-bottom: 1px solid var(--line); }}
+    .frame-row:last-child {{ border-bottom: 0; }}
+    .frame-meta {{ color: var(--muted); font-size: 12px; }}
+    .frame-features {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; margin-top: 8px; }}
+    .metric-table {{ width: 100%; border-collapse: collapse; }}
+    .metric-table th, .metric-table td {{ text-align: left; padding: 7px 8px; border-bottom: 1px solid #e9eef2; vertical-align: top; }}
+    .metric-table th {{ width: 190px; color: var(--muted); font-weight: 600; }}
+    .tag-list {{ display: flex; flex-wrap: wrap; gap: 5px; }}
+    .tag {{ background: var(--blue-soft); color: #174f7a; border-radius: 4px; padding: 2px 6px; font-size: 12px; }}
+    .tag.object {{ background: var(--accent-soft); color: #075e58; }}
+    .tag.ocr {{ background: var(--violet-soft); color: #563d82; }}
+    .empty {{ color: var(--muted); font-style: italic; }}
     details {{ margin-top: 10px; }}
     summary {{ cursor: pointer; color: var(--accent); font-weight: 600; }}
     pre {{
@@ -235,7 +308,8 @@ def render_caption_visualization_html(
     .hidden {{ display: none; }}
     mark {{ background: #fef08a; padding: 0 2px; }}
     @media (max-width: 900px) {{
-      .toolbar, .shot-head, .body, .grid-2 {{ grid-template-columns: 1fr; }}
+      .toolbar, .shot-head, .overview-grid, .grid-2, .feature-grid, .frame-row, .frame-features {{ grid-template-columns: 1fr; }}
+      .frame-row {{ gap: 8px; }}
     }}
   </style>
 </head>
@@ -243,7 +317,7 @@ def render_caption_visualization_html(
 <header>
   <div class="wrap">
     <h1>Caption Pipeline Visualization: {_escape(video_id)}</h1>
-    <div class="subtle">Source: {_escape(str(base_dir))}</div>
+    <div class="subtle">Source: {_escape(str(base_dir))} | images: {_escape(image_mode)}</div>
     <div class="toolbar">
       <input id="filter" placeholder="Filter by caption, OCR, audio, object, shot id...">
       <select id="modeFilter" aria-label="Mode filter">
@@ -267,7 +341,7 @@ def render_caption_visualization_html(
   {warnings}
   <section class="grid-2">{mode_blocks}</section>
   <section>
-    <h2>Shot Timeline</h2>
+    <h2>Shot Timeline <span id="visibleCount" class="subtle"></span></h2>
     <div id="timeline" class="timeline">{shot_cards}</div>
   </section>
   <section>
@@ -280,6 +354,7 @@ const filter = document.getElementById('filter');
 const modeFilter = document.getElementById('modeFilter');
 const eventFilter = document.getElementById('eventFilter');
 const cards = Array.from(document.querySelectorAll('.shot'));
+const visibleCount = document.getElementById('visibleCount');
 
 function applyFilter() {{
   const q = filter.value.trim().toLowerCase();
@@ -295,10 +370,20 @@ function applyFilter() {{
     if (show) visible += 1;
   }}
   document.title = `Caption Pipeline Visualization - ${{visible}}/${{cards.length}} shots`;
+  visibleCount.textContent = `(${{visible}}/${{cards.length}})`;
 }}
 filter.addEventListener('input', applyFilter);
 modeFilter.addEventListener('change', applyFilter);
 eventFilter.addEventListener('change', applyFilter);
+document.addEventListener('click', (event) => {{
+  const button = event.target.closest('.tab-button');
+  if (!button) return;
+  const shot = button.closest('.shot');
+  const tabName = button.dataset.tab;
+  shot.querySelectorAll('.tab-button').forEach(item => item.classList.toggle('active', item === button));
+  shot.querySelectorAll('.tab-pane').forEach(pane => pane.classList.toggle('active', pane.dataset.pane === tabName));
+}});
+applyFilter();
 </script>
 </body>
 </html>
@@ -308,6 +393,8 @@ eventFilter.addEventListener('change', applyFilter);
 def _default_paths(base_dir: Path) -> dict[str, Path]:
     return {
         "frame_index": base_dir / "captions" / "frame_index.jsonl",
+        "frame_evidence": base_dir / "evidence" / "frame_evidence.jsonl",
+        "shot_evidence": base_dir / "evidence" / "shot_evidence.jsonl",
         "shot_index": base_dir / "captions" / "shot_index.jsonl",
         "event_step_index": base_dir / "captions" / "event_step_index.jsonl",
         "compact_index": base_dir / "indexes" / "compact_search_index.jsonl",
@@ -432,9 +519,13 @@ def _render_shot_card(
     shot: dict,
     event: dict | None,
     frame_map: dict[str, dict],
+    frame_evidence_map: dict[str, dict],
+    shot_evidence: dict,
+    shot_frames: list[dict],
     output_path: Path,
     keyframes_root: Path | None,
     max_frames: int,
+    image_mode: str,
 ) -> str:
     event = event or {}
     shot_id = shot.get("shot_id", "")
@@ -474,21 +565,27 @@ def _render_shot_card(
         ("role:" + str(role), ""),
         (f"frames:{shot.get('frame_count', 0)}", ""),
     ]
+    representative_frames = []
+    for frame_id in shot.get("representative_frame_ids") or []:
+        if frame_id in frame_map:
+            representative_frames.append(frame_map[frame_id])
+    if not representative_frames:
+        representative_frames = shot_frames
     thumb_html = _render_thumbnails(
-        shot=shot,
-        frame_map=frame_map,
+        frames=representative_frames[:max(max_frames, 0)],
+        frame_evidence_map=frame_evidence_map,
         output_path=output_path,
         keyframes_root=keyframes_root,
-        max_frames=max_frames,
+        image_mode=image_mode,
     )
-    objects = evidence.get("object_text", "") or source.get("object_text", "")
-    scene = evidence.get("scene_text", "") or source.get("scene_text", "")
-    ocr = evidence.get("merged_ocr_text", "") or source.get("merged_ocr_text", "")
-    audio = evidence.get("merged_audio_text", "") or source.get("merged_audio_text", "")
     warnings = (quality.get("warnings") or []) + (event_quality.get("warnings") or [])
     warn_html = ""
     if warnings:
         warn_html = f"""<p class="text-block"><b>Warnings</b>{_escape("; ".join(map(str, warnings)))}</p>"""
+    frame_rows = _render_frame_rows(shot_frames, frame_evidence_map)
+    feature_html = _render_feature_overview(shot_evidence, evidence, source)
+    event_html = _render_event_detail(event)
+    diagnostics_html = _render_diagnostics(shot, event, shot_frames)
     return f"""<article class="shot" data-search="{_escape_attr(search_text)}" data-modes="{_escape_attr(modes)}" data-role="{_escape_attr(str(role))}">
   <div class="shot-head">
     <div>
@@ -502,78 +599,286 @@ def _render_shot_card(
     </div>
     <div class="subtle">step {_escape(str(event.get("step_order", "")))}</div>
   </div>
-  <div class="body">
-    <div>
-      <p class="text-block"><b>Event caption</b>{_escape(event.get("event_caption", ""))}</p>
-      <p class="text-block"><b>TRAKE text</b>{_escape(event.get("trake_text", ""))}</p>
-      {warn_html}
-      {thumb_html}
-    </div>
-    <div class="evidence">
-      {_evidence_block("Objects", objects)}
-      {_evidence_block("Scene", scene)}
-      {_evidence_block("OCR", ocr)}
-      {_evidence_block("Audio", audio)}
-      <details>
-        <summary>Raw event JSON</summary>
-        <pre>{_escape(json.dumps(event, ensure_ascii=False, indent=2))}</pre>
-      </details>
-    </div>
+  <div class="tabbar" role="tablist">
+    <button class="tab-button active" data-tab="overview" type="button">Overview</button>
+    <button class="tab-button" data-tab="frames" type="button">Frames ({len(shot_frames)})</button>
+    <button class="tab-button" data-tab="features" type="button">Features</button>
+    <button class="tab-button" data-tab="event" type="button">Event / TRAKE</button>
+    <button class="tab-button" data-tab="diagnostics" type="button">Search &amp; Quality</button>
+  </div>
+  <div class="shot-main">
+    <section class="tab-pane active" data-pane="overview">
+      <div class="overview-grid">
+        <div>{thumb_html}</div>
+        <div class="caption-stack">
+          <p class="text-block"><b>Event caption</b>{_value(event.get("event_caption"))}</p>
+          <p class="text-block"><b>TRAKE text</b>{_value(event.get("trake_text"))}</p>
+          {warn_html}
+        </div>
+      </div>
+    </section>
+    <section class="tab-pane" data-pane="frames">{frame_rows}</section>
+    <section class="tab-pane" data-pane="features">{feature_html}</section>
+    <section class="tab-pane" data-pane="event">{event_html}</section>
+    <section class="tab-pane" data-pane="diagnostics">{diagnostics_html}</section>
   </div>
 </article>"""
 
 
 def _render_thumbnails(
     *,
-    shot: dict,
-    frame_map: dict[str, dict],
+    frames: list[dict],
+    frame_evidence_map: dict[str, dict],
     output_path: Path,
     keyframes_root: Path | None,
-    max_frames: int,
+    image_mode: str,
 ) -> str:
-    frame_ids = (shot.get("representative_frame_ids") or [])[:max(max_frames, 0)]
-    if not frame_ids:
-        return ""
+    if not frames:
+        return '<div class="image-missing">No representative frames</div>'
     thumbs = []
-    for frame_id in frame_ids:
-        frame = frame_map.get(frame_id, {})
+    for frame in frames:
+        frame_id = frame.get("canonical_frame_id") or frame.get("frame_id") or "unknown"
+        resolved_frame = dict(frame)
+        frame_evidence = frame_evidence_map.get(frame_id, {})
+        for key in (
+            "image_path",
+            "image_relpath",
+            "frame_name",
+            "keyframe_idx",
+            "source_frame_idx",
+        ):
+            if resolved_frame.get(key) in (None, "") and frame_evidence.get(key) not in (None, ""):
+                resolved_frame[key] = frame_evidence[key]
         caption = frame.get("caption_text", "")
-        src = _image_src(frame, output_path, keyframes_root)
-        image = f'<img src="{_escape_attr(src)}" alt="{_escape_attr(frame_id)}">' if src else ""
+        src, image_status = _image_src(
+            resolved_frame, output_path, keyframes_root, image_mode,
+        )
+        if src:
+            image = f'<img src="{_escape_attr(src)}" alt="{_escape_attr(frame_id)}" loading="lazy">'
+        else:
+            image = f'<div class="image-missing">Image unavailable<br>{_escape(image_status)}</div>'
         thumbs.append(
-            f"""<div class="thumb">{image}<div class="cap"><b>{_escape(frame_id)}</b><br>{_escape(caption)}</div></div>"""
+            f"""<div class="thumb">{image}<div class="cap"><b>{_escape(frame_id)}</b> &middot; {_fmt_time(frame.get("timestamp_sec"))}<br>{_value(caption)}</div></div>"""
         )
     return f"""<div class="thumbs">{''.join(thumbs)}</div>"""
 
 
-def _image_src(frame: dict, output_path: Path, keyframes_root: Path | None) -> str:
-    raw = frame.get("image_path") or ""
-    rel = frame.get("image_relpath") or ""
-    video_id = frame.get("video_id", "")
-    candidates = []
+def _image_src(
+    frame: dict,
+    output_path: Path,
+    keyframes_root: Path | None,
+    image_mode: str,
+) -> tuple[str, str]:
+    path, candidates = _resolve_image_path(frame, keyframes_root)
+    if path is None:
+        sample = ", ".join(str(item) for item in candidates[:3])
+        return "", f"checked: {sample}" if sample else "no image metadata"
+
+    if image_mode == "embed":
+        mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+        payload = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{payload}", str(path)
+
+    if image_mode == "copy":
+        assets_dir = output_path.parent / f"{output_path.stem}_assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        frame_id = str(frame.get("canonical_frame_id") or frame.get("frame_id") or path.stem)
+        target = assets_dir / f"{frame_id}{path.suffix.lower()}"
+        if not target.exists() or target.stat().st_size != path.stat().st_size:
+            shutil.copy2(path, target)
+        return target.relative_to(output_path.parent).as_posix(), str(path)
+
+    try:
+        return path.resolve().relative_to(output_path.parent.resolve()).as_posix(), str(path)
+    except ValueError:
+        return path.resolve().as_uri(), str(path)
+
+
+def _resolve_image_path(frame: dict, keyframes_root: Path | None) -> tuple[Path | None, list[Path]]:
+    video_id = str(frame.get("video_id") or "")
+    raw = str(frame.get("image_path") or "")
+    rel = str(frame.get("image_relpath") or "")
+    frame_id = str(frame.get("frame_id") or frame.get("canonical_frame_id") or "")
+    canonical_id = str(frame.get("canonical_frame_id") or frame_id)
+    frame_name = str(frame.get("frame_name") or "")
+    names = [frame_name, Path(rel).name if rel else ""]
+    if frame_id:
+        names.extend([frame_id, f"{frame_id}.jpg", f"{frame_id}.png"])
+    suffix = canonical_id.rsplit("_", 1)[-1] if canonical_id else ""
+    if suffix:
+        names.extend([f"{suffix}.jpg", f"{suffix}.png"])
+    keyframe_idx = frame.get("keyframe_idx")
+    if isinstance(keyframe_idx, int):
+        names.extend([f"{keyframe_idx:03d}.jpg", f"{keyframe_idx:06d}.jpg"])
+
+    candidates: list[Path] = []
     if raw:
         candidates.append(Path(raw))
-    if keyframes_root and rel:
-        rel_path = Path(rel)
-        candidates.append(keyframes_root / rel_path)
-        if video_id and (not rel_path.parts or rel_path.parts[0] != video_id):
-            candidates.append(keyframes_root / str(video_id) / rel_path)
-    if keyframes_root and frame.get("frame_id"):
-        candidates.append(keyframes_root / str(video_id) / str(frame["frame_id"]))
-    for path in candidates:
-        if path.exists():
-            try:
-                return path.resolve().relative_to(output_path.parent.resolve()).as_posix()
-            except ValueError:
-                return path.resolve().as_uri()
-    return ""
+    if keyframes_root:
+        if rel:
+            rel_path = Path(rel)
+            candidates.extend([keyframes_root / rel_path, keyframes_root / video_id / rel_path.name])
+        for name in names:
+            if name:
+                candidates.append(keyframes_root / video_id / name)
+                candidates.append(keyframes_root / name)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+            if candidate.is_file():
+                return candidate, unique
+    return None, unique
 
 
-def _evidence_block(label: str, text: Any) -> str:
-    text = str(text or "")
-    if not text:
-        return f"""<p class="text-block subtle"><b>{_escape(label)}</b>empty</p>"""
-    return f"""<p class="text-block"><b>{_escape(label)}</b>{_escape(text)}</p>"""
+def _frames_by_shot(shot_index: list[dict], frame_index: list[dict]) -> dict[str, list[dict]]:
+    frames = sorted(
+        frame_index,
+        key=lambda row: (
+            float(row.get("timestamp_sec") or 0),
+            str(row.get("canonical_frame_id") or ""),
+        ),
+    )
+    result: dict[str, list[dict]] = {}
+    for shot in shot_index:
+        start = float(shot.get("start_sec") or 0)
+        end = float(shot.get("end_sec") or start)
+        result[str(shot.get("shot_id") or "")] = [
+            frame for frame in frames
+            if start - 0.001 <= float(frame.get("timestamp_sec") or 0) <= end + 0.001
+        ]
+    return result
+
+
+def _render_frame_rows(frames: list[dict], frame_evidence_map: dict[str, dict]) -> str:
+    if not frames:
+        return '<div class="empty">No frame records mapped to this shot.</div>'
+    rows = []
+    for frame in frames:
+        frame_id = str(frame.get("canonical_frame_id") or frame.get("frame_id") or "unknown")
+        evidence = frame_evidence_map.get(frame_id, {})
+        obj = evidence.get("object_evidence") or {}
+        ocr = evidence.get("ocr_evidence") or {}
+        audio = evidence.get("audio_evidence") or {}
+        quality = frame.get("quality") or {}
+        rows.append(f"""<div class="frame-row">
+  <div>
+    <b>{_escape(frame_id)}</b>
+    <div class="frame-meta">{_fmt_time(frame.get("timestamp_sec"))} | mode: {_escape(quality.get("caption_mode", "unknown"))}</div>
+    <div class="chips">{_boolean_chips(evidence.get("quality") or {})}</div>
+  </div>
+  <div>
+    <p class="text-block"><b>Frame caption</b>{_value(frame.get("caption_text"))}</p>
+    <div class="frame-features">
+      <div><b>Objects</b><br>{_tags(_object_items(obj), "object")}</div>
+      <div><b>Scene / RAM</b><br>{_tags((obj.get("scene_tags") or []) + (obj.get("ram_tags") or []))}</div>
+      <div><b>OCR</b><br>{_value(ocr.get("ocr_text"))}</div>
+      <div><b>Audio ({_escape(audio.get("num_segments", 0))} segments)</b><br>{_value(audio.get("audio_text"))}</div>
+    </div>
+    <details><summary>Frame feature details</summary><pre>{_escape(json.dumps(evidence, ensure_ascii=False, indent=2))}</pre></details>
+  </div>
+</div>""")
+    return f'<div class="frame-list">{"".join(rows)}</div>'
+
+
+def _render_feature_overview(shot_evidence: dict, evidence: dict, source: dict) -> str:
+    counts = shot_evidence.get("merged_object_counts") or {}
+    object_items = [
+        f"{name} x{count}"
+        for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    scene_tags = shot_evidence.get("merged_scene_tags") or []
+    objects = evidence.get("object_text") or source.get("object_text") or ""
+    scene = evidence.get("scene_text") or source.get("scene_text") or ""
+    ocr = evidence.get("merged_ocr_text") or source.get("merged_ocr_text") or ""
+    audio = evidence.get("merged_audio_text") or source.get("merged_audio_text") or ""
+    return f"""<div class="feature-grid">
+  <section class="feature objects"><h3>Object Detection</h3>{_tags(object_items, "object")}<p>{_value(objects)}</p></section>
+  <section class="feature scene"><h3>Scene and RAM tags</h3>{_tags(scene_tags)}<p>{_value(scene)}</p></section>
+  <section class="feature ocr"><h3>OCR</h3><p>{_value(ocr)}</p></section>
+  <section class="feature audio"><h3>Audio / ASR</h3><p>{_value(audio)}</p></section>
+</div>"""
+
+
+def _render_event_detail(event: dict) -> str:
+    rows = [
+        ("Event caption", event.get("event_caption")),
+        ("Current observation", event.get("current_observation")),
+        ("Before context", event.get("before_context")),
+        ("After context", event.get("after_context")),
+        ("Action state", event.get("action_state")),
+        ("Temporal role", event.get("temporal_role")),
+        ("Actors", ", ".join(map(str, event.get("actors") or []))),
+        ("Actions", ", ".join(map(str, event.get("actions") or []))),
+        ("Objects involved", ", ".join(map(str, event.get("objects_involved") or []))),
+        ("Scene", event.get("scene")),
+        ("TRAKE text", event.get("trake_text")),
+    ]
+    return _table(rows)
+
+
+def _render_diagnostics(shot: dict, event: dict, frames: list[dict]) -> str:
+    quality_rows = [
+        ("Shot quality", json.dumps(shot.get("quality") or {}, ensure_ascii=False)),
+        ("Event quality", json.dumps(event.get("quality") or {}, ensure_ascii=False)),
+    ]
+    search_rows = [(name, value) for name, value in (shot.get("search_fields") or {}).items()]
+    raw = {"shot": shot, "event": event, "frames": frames}
+    return f"""<div class="grid-2">
+  <div><h3>Quality and provenance</h3>{_table(quality_rows)}</div>
+  <div><h3>Search fields</h3>{_table(search_rows)}</div>
+</div>
+<details><summary>Raw shot, event and frame JSON</summary><pre>{_escape(json.dumps(raw, ensure_ascii=False, indent=2))}</pre></details>"""
+
+
+def _table(rows: list[tuple[str, Any]]) -> str:
+    body = "".join(f"<tr><th>{_escape(label)}</th><td>{_value(value)}</td></tr>" for label, value in rows)
+    return f'<table class="metric-table"><tbody>{body}</tbody></table>'
+
+
+def _object_items(obj: dict) -> list[str]:
+    counts = obj.get("object_counts") or {}
+    if counts:
+        return [
+            f"{name} x{count}"
+            for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        ]
+    return list(obj.get("important_objects") or obj.get("object_tags") or [])
+
+
+def _tags(values: list[Any], kind: str = "") -> str:
+    clean = [str(value) for value in values if str(value).strip()]
+    if not clean:
+        return '<span class="empty">none</span>'
+    class_name = f"tag {kind}".strip()
+    items = "".join(
+        '<span class="{}">{}</span>'.format(class_name, _escape(value))
+        for value in clean
+    )
+    return f'<span class="tag-list">{items}</span>'
+
+
+def _boolean_chips(quality: dict) -> str:
+    labels = []
+    fields = [
+        ("has_object", "objects"),
+        ("has_scene_tags", "scene"),
+        ("has_ocr", "ocr"),
+        ("has_audio", "audio"),
+    ]
+    for key, label in fields:
+        labels.append(_chip(label, "" if quality.get(key) else "warn"))
+    return "".join(labels)
+
+
+def _value(value: Any) -> str:
+    if value is None or value == "" or value == [] or value == {}:
+        return '<span class="empty">empty</span>'
+    return _escape(value)
 
 
 def _chip(label: str, class_name: str = "") -> str:

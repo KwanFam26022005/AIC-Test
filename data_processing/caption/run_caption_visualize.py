@@ -40,6 +40,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=3,
         help="Maximum representative frame thumbnails per shot.",
     )
+    parser.add_argument(
+        "--image-mode",
+        choices=("embed", "copy", "link"),
+        default="embed",
+        help=(
+            "How images are packaged: embed creates a portable HTML, copy writes "
+            "a sibling assets folder, and link references the original files."
+        ),
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
     return parser.parse_args(argv)
 
@@ -59,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
             output_html=Path(args.output_html) if args.output_html else None,
             keyframes_root=Path(args.keyframes_root) if args.keyframes_root else None,
             max_frames_per_shot=args.max_frames_per_shot,
+            image_mode=args.image_mode,
         )
     except Exception:
         logger.exception("Failed to render caption visualization")
