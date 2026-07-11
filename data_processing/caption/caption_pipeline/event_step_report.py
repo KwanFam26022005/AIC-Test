@@ -20,6 +20,8 @@ def build_event_step_report(
     num_fallback = sum(1 for row in event_records if row.get("fallback_used"))
 
     event_mode_counts: dict[str, int] = {}
+    event_model_counts: dict[str, int] = {}
+    prompt_version_counts: dict[str, int] = {}
     action_state_counts: dict[str, int] = {}
     temporal_role_counts: dict[str, int] = {}
     for row in event_step_index:
@@ -28,6 +30,10 @@ def build_event_step_report(
         action_state = row.get("action_state", "unknown")
         temporal_role = row.get("temporal_role", "unknown")
         event_mode_counts[event_mode] = event_mode_counts.get(event_mode, 0) + 1
+        event_model = quality.get("event_model", "") or "none"
+        prompt_version = quality.get("prompt_version", "") or "none"
+        event_model_counts[event_model] = event_model_counts.get(event_model, 0) + 1
+        prompt_version_counts[prompt_version] = prompt_version_counts.get(prompt_version, 0) + 1
         action_state_counts[action_state] = action_state_counts.get(action_state, 0) + 1
         temporal_role_counts[temporal_role] = temporal_role_counts.get(temporal_role, 0) + 1
 
@@ -59,6 +65,8 @@ def build_event_step_report(
         "num_trake_text_empty": num_trake_empty,
         "num_fallback_used": num_fallback,
         "event_mode_counts": event_mode_counts,
+        "event_model_counts": event_model_counts,
+        "prompt_version_counts": prompt_version_counts,
         "action_state_counts": action_state_counts,
         "temporal_role_counts": temporal_role_counts,
         "duplicate_document_ids": duplicate_document_ids,
@@ -98,6 +106,8 @@ def render_event_step_report_markdown(report: dict[str, Any]) -> str:
     lines.append("")
 
     _append_counts_table(lines, "Event Mode Counts", report.get("event_mode_counts") or {})
+    _append_counts_table(lines, "Event Model Counts", report.get("event_model_counts") or {})
+    _append_counts_table(lines, "Prompt Version Counts", report.get("prompt_version_counts") or {})
     _append_counts_table(lines, "Action State Counts", report.get("action_state_counts") or {})
     _append_counts_table(lines, "Temporal Role Counts", report.get("temporal_role_counts") or {})
 

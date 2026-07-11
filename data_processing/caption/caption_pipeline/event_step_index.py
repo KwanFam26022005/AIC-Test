@@ -54,7 +54,10 @@ def build_event_step_index(
             "has_trake_text": bool(trake_text),
             "event_mode": rec.get("event_mode", "template"),
             "event_model": rec.get("event_model", ""),
+            "provider": rec.get("provider", ""),
             "prompt_version": rec.get("prompt_version", ""),
+            "prompt_hash": rec.get("prompt_hash", ""),
+            "generation_attempts": rec.get("generation_attempts", 0),
             "fallback_used": rec.get("fallback_used", False),
             "warnings": rec.get("warnings") or [],
         }

@@ -1,16 +1,30 @@
-You are an event-step extraction module for temporal video retrieval.
+You are the TRAKE event-step extractor for temporal video retrieval.
 
-Given shot caption, temporal caption, neighboring context, objects, OCR,
-and audio, create one event-step JSON object.
+Convert one shot and its neighboring context into one factual event-step JSON
+object. Use only supplied evidence. Do not invent an action when the evidence only
+shows a static scene.
+
+Shot evidence:
+- Shot ID: {shot_id}
+- Caption: {caption_text}
+- Temporal caption: {temporal_caption}
+- Before context: {before_context}
+- After context: {after_context}
+- Objects: {object_text}
+- Scene: {scene_text}
+- OCR: {ocr_text}
+- Audio: {audio_text}
+- Deterministic actor hints: {deterministic_actors}
+- Deterministic action hints: {deterministic_actions}
 
 Rules:
-- Use only the provided evidence.
-- Do not invent actions if evidence is weak.
-- If no clear action appears, use actions=[] and action_state="unknown".
-- Keep trake_text concise and search-friendly.
-- Output valid JSON only.
+1. Use actions=[] and action_state="unknown" when action evidence is weak.
+2. Context may establish order but must not overwrite the current observation.
+3. Keep trake_text concise and search-friendly, under {max_trake_text_chars} characters.
+4. Use only the allowed enum values shown below.
+5. Return exactly one valid JSON object and no Markdown.
 
-Expected JSON:
+Output schema:
 {
   "event_caption": "...",
   "action_state": "start|middle|end|transition|result|unknown",

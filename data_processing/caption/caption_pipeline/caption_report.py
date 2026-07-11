@@ -35,9 +35,15 @@ def build_caption_report(
 
     # Caption mode distribution
     mode_counts: dict[str, int] = {}
+    model_counts: dict[str, int] = {}
+    prompt_counts: dict[str, int] = {}
     for r in caption_records:
         mode = r.get("caption_mode", "unknown")
         mode_counts[mode] = mode_counts.get(mode, 0) + 1
+        model = r.get("caption_model", "") or "none"
+        prompt = r.get("prompt_version", "") or "none"
+        model_counts[model] = model_counts.get(model, 0) + 1
+        prompt_counts[prompt] = prompt_counts.get(prompt, 0) + 1
 
     # Collect all warnings
     all_warnings: list[str] = []
@@ -81,6 +87,8 @@ def build_caption_report(
             "scene": num_used_scene,
         },
         "caption_mode_counts": mode_counts,
+        "caption_model_counts": model_counts,
+        "prompt_version_counts": prompt_counts,
         "duplicate_document_ids": duplicate_doc_ids,
         "duplicate_canonical_frame_ids": duplicate_cfids,
         "num_frame_warnings": len(frame_warnings),
@@ -142,6 +150,9 @@ def render_caption_report_markdown(report: dict[str, Any]) -> str:
             lines.append(f"| {mode} | {count} |")
         lines.append("")
 
+    _append_counts_table(lines, "Caption Model Distribution", report.get("caption_model_counts") or {})
+    _append_counts_table(lines, "Prompt Version Distribution", report.get("prompt_version_counts") or {})
+
     # --- Warnings ---
     warnings = report.get("summary_warnings") or []
     if warnings:
@@ -183,3 +194,15 @@ def render_caption_report_markdown(report: dict[str, Any]) -> str:
 
     lines.append("")
     return "\n".join(lines)
+
+
+def _append_counts_table(lines: list[str], title: str, counts: dict[str, int]) -> None:
+    if not counts:
+        return
+    lines.append(f"## {title}")
+    lines.append("")
+    lines.append("| Value | Count |")
+    lines.append("|-------|------:|")
+    for key, value in sorted(counts.items()):
+        lines.append(f"| {key} | {value} |")
+    lines.append("")

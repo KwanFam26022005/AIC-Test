@@ -4,16 +4,18 @@ Implements sections 4.1 and 5 of the Phase 2 plan.
 
 Two modes:
 - ``template``: deterministic, search-friendly captions from evidence text.
-- ``llm``: (placeholder) will send prompts to an LLM and parse JSON output.
-  Falls back to template mode on failure.
+- ``llm``: prompt-backed evidence fusion with per-frame template fallback.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
 from .config import PipelineConfig
+from .runtime import JsonlCheckpoint, TextLLMRuntime, stable_input_signature
+from .runtime.json_output import require_text
 from .text_utils import normalize_whitespace, truncate
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,9 @@ _RAM_MAX_TAGS = 10
 def fuse_frame_captions(
     frame_evidence: list[dict],
     cfg: PipelineConfig,
+    llm_runtime: TextLLMRuntime | None = None,
+    initial_captions: dict[str, str] | None = None,
+    checkpoint: JsonlCheckpoint | None = None,
 ) -> list[dict]:
     """Generate caption records for each frame evidence.
 
@@ -42,17 +47,55 @@ def fuse_frame_captions(
     mode = cfg.frame_caption.caption_mode
     results: list[dict] = []
 
+    initial_captions = initial_captions or {}
     for fe in frame_evidence:
+        frame_id = fe["canonical_frame_id"]
+        input_signature = stable_input_signature({
+            "frame_evidence": fe,
+            "initial_caption": initial_captions.get(frame_id, ""),
+        })
+        if checkpoint:
+            existing = checkpoint.get(frame_id, input_signature=input_signature)
+            if existing:
+                results.append(existing)
+                continue
         if mode == "template":
             caption_rec = _template_caption(fe, cfg)
+        elif llm_runtime is not None:
+            try:
+                caption_rec = _llm_caption(
+                    fe,
+                    cfg,
+                    llm_runtime,
+                    initial_captions.get(frame_id, ""),
+                )
+            except Exception as exc:  # noqa: BLE001 - record-level fallback keeps long jobs alive.
+                logger.exception("Frame caption LLM failed for %s", frame_id)
+                caption_rec = _template_caption(fe, cfg)
+                caption_rec.update({
+                    "caption_mode": "fallback",
+                    "caption_model": llm_runtime.model_name,
+                    "provider": llm_runtime.provider,
+                    "prompt_version": llm_runtime.prompt_version,
+                    "fallback_used": True,
+                })
+                caption_rec["warnings"].append(
+                    f"llm_generation_failed:{type(exc).__name__}:{truncate(str(exc), 180)}"
+                )
         else:
-            # Future: LLM mode with fallback
             caption_rec = _template_caption(fe, cfg)
             caption_rec["caption_mode"] = "fallback"
             caption_rec["fallback_used"] = True
-            caption_rec["warnings"].append("llm_mode_not_implemented_using_template")
+            caption_rec["warnings"].append("llm_runtime_unavailable_using_template")
 
         results.append(caption_rec)
+        if checkpoint:
+            caption_rec["input_signature"] = input_signature
+            checkpoint.put(caption_rec)
+
+    if checkpoint:
+        checkpoint.flush()
+        logger.info("Frame caption checkpoint reused %d rows", checkpoint.num_reused)
 
     num_generated = sum(1 for r in results if r.get("caption_text"))
     num_empty = sum(1 for r in results if not r.get("caption_text"))
@@ -63,6 +106,67 @@ def fuse_frame_captions(
         len(results), num_generated, num_empty, num_fallback,
     )
     return results
+
+
+def _llm_caption(
+    fe: dict,
+    cfg: PipelineConfig,
+    runtime: TextLLMRuntime,
+    initial_caption: str,
+) -> dict[str, Any]:
+    obj_ev = fe.get("object_evidence") or {}
+    ocr_ev = fe.get("ocr_evidence") or {}
+    aud_ev = fe.get("audio_evidence") or {}
+    quality = fe.get("quality") or {}
+    values = {
+        "initial_caption": initial_caption or "",
+        "scene_tags": json.dumps(obj_ev.get("scene_tags") or [], ensure_ascii=False),
+        "important_objects": json.dumps(obj_ev.get("important_objects") or [], ensure_ascii=False),
+        "ocr_text": ocr_ev.get("ocr_text", "") or "",
+        "audio_text": aud_ev.get("audio_text", "") or "",
+        "quality_flags": json.dumps(quality, ensure_ascii=False),
+        "max_caption_chars": cfg.frame_caption.max_caption_chars,
+    }
+
+    def validate(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "caption_text": require_text(
+                payload,
+                "caption_text",
+                cfg.frame_caption.max_caption_chars,
+            ),
+        }
+
+    outcome = runtime.generate_task(
+        "frame",
+        values,
+        required_fields=("caption_text",),
+        max_new_tokens=cfg.llm.frame_max_new_tokens,
+        validator=validate,
+    )
+    caption_text = _finalize_caption(
+        outcome.data["caption_text"],
+        cfg.frame_caption.max_caption_chars,
+    )
+    return {
+        "canonical_frame_id": fe["canonical_frame_id"],
+        "caption_text": caption_text,
+        "caption_mode": "llm",
+        "caption_model": runtime.model_name,
+        "provider": runtime.provider,
+        "prompt_version": runtime.prompt_version,
+        "prompt_hash": outcome.prompt_hash,
+        "prompt_path": outcome.prompt_path,
+        "generation_attempts": outcome.attempts,
+        "initial_caption": initial_caption or "",
+        "initial_caption_used": bool(initial_caption),
+        "used_ocr": bool(values["ocr_text"]),
+        "used_audio": bool(values["audio_text"]),
+        "used_objects": bool(obj_ev.get("important_objects")),
+        "used_scene": bool(obj_ev.get("scene_tags")),
+        "fallback_used": False,
+        "warnings": [],
+    }
 
 
 # ---------------------------------------------------------------------------

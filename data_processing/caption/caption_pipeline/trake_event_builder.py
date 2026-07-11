@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
 from .config import PipelineConfig
+from .runtime import JsonlCheckpoint, TextLLMRuntime, stable_input_signature
+from .runtime.json_output import (
+    enum_value,
+    optional_text,
+    require_text,
+    string_list,
+)
 from .text_utils import join_texts, normalize_whitespace, truncate
 
 logger = logging.getLogger(__name__)
@@ -35,6 +43,8 @@ def build_trake_event_steps(
     shot_index: list[dict],
     shot_evidence: list[dict],
     cfg: PipelineConfig,
+    llm_runtime: TextLLMRuntime | None = None,
+    checkpoint: JsonlCheckpoint | None = None,
 ) -> list[dict]:
     """Build deterministic TRAKE event-step records from shot captions."""
     evidence_map = {
@@ -50,9 +60,21 @@ def build_trake_event_steps(
     results: list[dict] = []
 
     for idx, shot in enumerate(shots):
+        shot_id = shot["shot_id"]
         prev_shot = shots[idx - 1] if idx > 0 else None
         next_shot = shots[idx + 1] if idx < len(shots) - 1 else None
         evidence = evidence_map.get(shot.get("shot_id", ""), {})
+        input_signature = stable_input_signature({
+            "shot": shot,
+            "evidence": evidence,
+            "previous_shot": prev_shot,
+            "next_shot": next_shot,
+        })
+        if checkpoint:
+            existing = checkpoint.get(shot_id, input_signature=input_signature)
+            if existing:
+                results.append(existing)
+                continue
 
         rec = _template_event_step(
             shot=shot,
@@ -63,11 +85,33 @@ def build_trake_event_steps(
             idx=idx,
             num_steps=len(shots),
         )
-        if mode != "template":
+        if mode != "template" and llm_runtime is not None:
+            try:
+                rec = _llm_event_step(rec, shot, evidence, cfg, llm_runtime)
+            except Exception as exc:  # noqa: BLE001 - preserve deterministic event fallback.
+                logger.exception("TRAKE LLM failed for %s", shot_id)
+                rec.update({
+                    "event_mode": "fallback",
+                    "event_model": llm_runtime.model_name,
+                    "provider": llm_runtime.provider,
+                    "prompt_version": llm_runtime.prompt_version,
+                    "fallback_used": True,
+                })
+                rec["warnings"].append(
+                    f"llm_generation_failed:{type(exc).__name__}:{truncate(str(exc), 180)}"
+                )
+        elif mode != "template":
             rec["event_mode"] = "fallback"
             rec["fallback_used"] = True
-            rec["warnings"].append("llm_mode_not_implemented_using_template")
+            rec["warnings"].append("llm_runtime_unavailable_using_template")
         results.append(rec)
+        if checkpoint:
+            rec["input_signature"] = input_signature
+            checkpoint.put(rec)
+
+    if checkpoint:
+        checkpoint.flush()
+        logger.info("TRAKE checkpoint reused %d rows", checkpoint.num_reused)
 
     num_text = sum(1 for row in results if row.get("trake_text"))
     num_fallback = sum(1 for row in results if row.get("fallback_used"))
@@ -76,6 +120,110 @@ def build_trake_event_steps(
         len(results), num_text, num_fallback,
     )
     return results
+
+
+def _llm_event_step(
+    base: dict[str, Any],
+    shot: dict,
+    evidence: dict,
+    cfg: PipelineConfig,
+    runtime: TextLLMRuntime,
+) -> dict[str, Any]:
+    source = shot.get("evidence_text") or {}
+    values = {
+        "shot_id": shot["shot_id"],
+        "caption_text": shot.get("caption_text", "") or "",
+        "temporal_caption": shot.get("temporal_caption", "") or "",
+        "before_context": base.get("before_context", "") or "",
+        "after_context": base.get("after_context", "") or "",
+        "object_text": source.get("object_text", "") or "",
+        "scene_text": source.get("scene_text", "") or " ".join(evidence.get("merged_scene_tags") or []),
+        "ocr_text": source.get("merged_ocr_text", "") or evidence.get("merged_ocr_text", "") or "",
+        "audio_text": source.get("merged_audio_text", "") or evidence.get("merged_audio_text", "") or "",
+        "deterministic_actors": json.dumps(base.get("actors") or [], ensure_ascii=False),
+        "deterministic_actions": json.dumps(base.get("actions") or [], ensure_ascii=False),
+        "max_trake_text_chars": cfg.trake_event.max_trake_text_chars,
+    }
+    allowed_action_states = {"start", "middle", "end", "transition", "result", "unknown"}
+    allowed_temporal_roles = {"beginning", "continuation", "change", "completion", "unknown"}
+
+    def validate(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "event_caption": require_text(
+                payload,
+                "event_caption",
+                cfg.trake_event.max_current_observation_chars,
+            ),
+            "action_state": enum_value(
+                payload,
+                "action_state",
+                allowed_action_states,
+            ),
+            "temporal_role": enum_value(
+                payload,
+                "temporal_role",
+                allowed_temporal_roles,
+            ),
+            "actors": string_list(payload, "actors", 8),
+            "actions": string_list(payload, "actions", 8),
+            "objects_involved": string_list(payload, "objects_involved", 12),
+            "scene": optional_text(payload, "scene", 240),
+            "before_context": optional_text(
+                payload,
+                "before_context",
+                cfg.trake_event.max_before_context_chars,
+            ),
+            "current_observation": require_text(
+                payload,
+                "current_observation",
+                cfg.trake_event.max_current_observation_chars,
+            ),
+            "after_context": optional_text(
+                payload,
+                "after_context",
+                cfg.trake_event.max_after_context_chars,
+            ),
+            "trake_text": require_text(
+                payload,
+                "trake_text",
+                cfg.trake_event.max_trake_text_chars,
+            ),
+        }
+
+    required = (
+        "event_caption",
+        "action_state",
+        "temporal_role",
+        "actors",
+        "actions",
+        "objects_involved",
+        "scene",
+        "before_context",
+        "current_observation",
+        "after_context",
+        "trake_text",
+    )
+    outcome = runtime.generate_task(
+        "trake",
+        values,
+        required_fields=required,
+        max_new_tokens=cfg.llm.trake_max_new_tokens,
+        validator=validate,
+    )
+    result = dict(base)
+    result.update(outcome.data)
+    result.update({
+        "event_mode": "llm",
+        "event_model": runtime.model_name,
+        "provider": runtime.provider,
+        "prompt_version": runtime.prompt_version,
+        "prompt_hash": outcome.prompt_hash,
+        "prompt_path": outcome.prompt_path,
+        "generation_attempts": outcome.attempts,
+        "fallback_used": False,
+        "warnings": [],
+    })
+    return result
 
 
 def _template_event_step(

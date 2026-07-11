@@ -1,0 +1,31 @@
+name: aic-caption-vlm
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip>=24
+  - pytorch=2.5.1
+  - torchvision=0.20.1
+  - torchaudio=2.5.1
+  - pytorch-cuda=12.1
+  - pillow
+  - pyyaml
+  - numpy
+  - tqdm
+  - ninja
+  - packaging
+  - pip:
+      - "transformers==5.13.0"
+      - "accelerate==1.14.0"
+      - "safetensors>=0.4.5"
+      - "qwen-vl-utils==0.0.14"
+      - "sentencepiece>=0.2.0"
+      - "protobuf>=4.25.0"
+      - "einops>=0.8.0"
+      - "jsonschema>=4.23.0"
+
+# Install flash-attn==2.8.3.post1 only after PyTorch is installed. The wheel
+# must be built for Python 3.10, torch 2.5.1, and CUDA 12.1; otherwise use SDPA.

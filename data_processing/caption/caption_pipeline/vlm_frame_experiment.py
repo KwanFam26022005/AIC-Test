@@ -1,8 +1,8 @@
-"""VLM frame-caption experiment runner.
+"""VLM frame-caption override runner.
 
 This module intentionally writes only frame-caption override JSONL files.
-The baseline caption outputs stay untouched; use
-``run_caption_experiment_materialize.py`` to create a comparable experiment.
+The official pipeline consumes those overrides in a later prompt-backed
+caption pass.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .io_utils import read_jsonl, utc_now_iso, write_json, write_jsonl
+from .runtime.env_loader import expand_env_values, load_env_file
 from .text_utils import normalize_whitespace, truncate
 
 logger = logging.getLogger(__name__)
@@ -26,32 +27,6 @@ DEFAULT_PROMPT = (
 
 
 
-def load_env_file(path: str | Path, override: bool = False) -> dict[str, str]:
-    """Load simple KEY=VALUE lines from a .env file into os.environ."""
-    target = Path(path)
-    if not target.exists():
-        raise FileNotFoundError(f"Missing env file: {target}")
-    loaded: dict[str, str] = {}
-    with target.open("r", encoding="utf-8") as f:
-        for line_no, raw_line in enumerate(f, start=1):
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("export "):
-                line = line[len("export "):].strip()
-            if "=" not in line:
-                raise ValueError(f"Invalid .env line {target}:{line_no}: {raw_line.rstrip()}")
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if not key:
-                raise ValueError(f"Invalid empty .env key at {target}:{line_no}")
-            if override or key not in os.environ:
-                os.environ[key] = value
-            loaded[key] = os.environ.get(key, value)
-    return loaded
-
-
 def load_vlm_experiment_config(path: str | Path) -> dict[str, Any]:
     """Load YAML config and expand environment variables in string values."""
     try:
@@ -62,7 +37,7 @@ def load_vlm_experiment_config(path: str | Path) -> dict[str, Any]:
         cfg = yaml.safe_load(f) or {}
     if not isinstance(cfg, dict):
         raise ValueError(f"Config must be a mapping: {path}")
-    return _expand_env(cfg)
+    return expand_env_values(cfg)
 
 
 def run_vlm_frame_experiment(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -321,7 +296,7 @@ class Qwen25VLCaptioner:
         if self.model is None:
             raise RuntimeError(f"Could not load Qwen2.5-VL model {model_name}") from last_error
         self.processor = AutoProcessor.from_pretrained(model_name)
-        self.prompt = generation.get("prompt", DEFAULT_PROMPT)
+        self.prompt = _generation_prompt(generation)
 
     def caption_image(self, image_path: Path) -> str:
         messages = [
@@ -387,7 +362,7 @@ class InternVLCaptioner:
             trust_remote_code=True,
             device_map=model_cfg.get("device_map", "auto"),
         ).eval()
-        self.prompt = generation.get("prompt", DEFAULT_PROMPT)
+        self.prompt = _generation_prompt(generation)
 
     def caption_image(self, image_path: Path) -> str:
         from PIL import Image
@@ -476,22 +451,17 @@ def _first_model_device(model):
     except StopIteration:
         return "cuda"
 
+
+def _generation_prompt(generation: dict[str, Any]) -> str:
+    prompt_file = generation.get("prompt_file", "") or ""
+    if prompt_file:
+        path = Path(prompt_file)
+        if not path.exists():
+            raise FileNotFoundError(f"VLM prompt file not found: {path}")
+        return path.read_text(encoding="utf-8").strip()
+    return generation.get("prompt", DEFAULT_PROMPT) or DEFAULT_PROMPT
+
 def _resolve_video_dir(root: Path, video_id: str) -> Path:
     if (root / "captions").exists() and (root / "indexes").exists():
         return root
     return root / video_id
-
-
-def _expand_env(value):
-    if isinstance(value, dict):
-        return {k: _expand_env(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_expand_env(v) for v in value]
-    if isinstance(value, str):
-        return os.path.expandvars(value)
-    return value
-
-
-
-
-

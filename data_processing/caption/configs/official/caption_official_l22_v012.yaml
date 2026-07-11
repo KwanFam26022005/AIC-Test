@@ -1,0 +1,41 @@
+pipeline:
+  version: caption_qwen25_official_v1
+  video_id: L22_V012
+
+inputs:
+  ocr_jsonl: ${AIC_ROOT}/outputs/ocr_vlm_pipeline_v2/L22_V012/L22_V012_ocr_es_docs.jsonl
+  object_jsonl: ${AIC_ROOT}/outputs/object_detection/L22_V012_objects.jsonl
+  audio_features: ${AIC_ROOT}/outputs/audio/L22_V012/features/audio_features.jsonl
+  keyframe_map: ${AIC_ROOT}/keyframe_test
+  keyframes_root: ${AIC_ROOT}/keyframe_test
+
+paths:
+  output_root: ${AIC_ROOT}/caption_official
+  work_root: ${AIC_ROOT}/caption_official_work
+  prompt_dir: ${AIC_ROOT}/data_processing/caption/caption_pipeline/prompts
+
+models:
+  vlm:
+    provider: qwen2_5_vl
+    model_name: Qwen/Qwen2.5-VL-7B-Instruct
+    dtype: bfloat16
+    device_map: auto
+    attn_implementation: flash_attention_2
+
+  text_llm:
+    provider: transformers
+    model_name: Qwen/Qwen2.5-7B-Instruct
+    dtype: bfloat16
+    device_map: auto
+    attn_implementation: flash_attention_2
+
+generation:
+  prompt_version: caption_qwen25_official_v1
+  vlm_prompt_version: qwen25vl_initial_caption_v1
+  vlm_max_new_tokens: 96
+  vlm_write_every: 20
+  max_fallback_rate: 0.15
+
+retrieval:
+  eval_name: official_route_gated
+  top_k: 20

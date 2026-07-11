@@ -1,0 +1,6 @@
+Describe this video keyframe for retrieval in concise English.
+
+Mention only clearly visible people, objects, scene, actions, layout, and readable
+on-screen text. Do not guess identities, locations, causes, or events outside the
+image. Do not mention technical metadata. Return plain caption text without JSON
+or Markdown, under 320 characters.

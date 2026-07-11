@@ -48,6 +48,7 @@ class FrameCaptionConfig:
 
     caption_mode: str = "template"  # "template" or "llm"
     rebuild_compact_with_captions: bool = False
+    max_caption_chars: int = 320
 
 
 @dataclass
@@ -75,6 +76,29 @@ class TrakeEventConfig:
 
 
 @dataclass
+class LLMRuntimeConfig:
+    """Shared text-model runtime for frame, shot, and TRAKE prompts."""
+
+    provider: str = "transformers"
+    model_name: str = "Qwen/Qwen2.5-7B-Instruct"
+    dtype: str = "bfloat16"
+    device_map: str = "auto"
+    attn_implementation: str = "auto"
+    prompt_dir: str = ""
+    prompt_version: str = "caption_qwen25_official_v1"
+    max_input_tokens: int = 4096
+    frame_max_new_tokens: int = 128
+    shot_max_new_tokens: int = 256
+    trake_max_new_tokens: int = 384
+    do_sample: bool = False
+    temperature: float = 0.0
+    max_retries: int = 2
+    resume: bool = True
+    checkpoint_every: int = 10
+    max_fallback_rate: float = 1.0
+
+
+@dataclass
 class PipelineConfig:
     """Top-level configuration aggregating all sub-configs."""
 
@@ -83,6 +107,7 @@ class PipelineConfig:
     object_jsonl: str = ""
     audio_features_jsonl: str = ""
     keyframe_map: str = ""
+    initial_caption_overrides: str = ""
     output_dir: str = ""
     include_ocr_only_frames: bool = False
     timestamp_tolerance: float = 0.001
@@ -108,12 +133,16 @@ class PipelineConfig:
     trake_event: TrakeEventConfig = field(
         default_factory=TrakeEventConfig,
     )
+    llm: LLMRuntimeConfig = field(
+        default_factory=LLMRuntimeConfig,
+    )
 
     # ---- derived paths (populated by resolve_paths) ----
     evidence_dir: str = ""
     captions_dir: str = ""
     indexes_dir: str = ""
     reports_dir: str = ""
+    checkpoints_dir: str = ""
 
     def resolve_paths(self) -> None:
         """Set derived output directories based on *output_dir* and *video_id*."""
@@ -122,3 +151,4 @@ class PipelineConfig:
         self.captions_dir = str(base / "captions")
         self.indexes_dir = str(base / "indexes")
         self.reports_dir = str(base / "reports")
+        self.checkpoints_dir = str(base / "checkpoints")

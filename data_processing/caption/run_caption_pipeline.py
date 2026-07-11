@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -54,6 +55,7 @@ from caption_pipeline.config import (
     AudioAlignmentConfig,
     EvidenceBuilderConfig,
     FrameCaptionConfig,
+    LLMRuntimeConfig,
     PipelineConfig,
     ShotCaptionConfig,
     ShotGroupingConfig,
@@ -70,7 +72,7 @@ from caption_pipeline.event_step_report import (
     render_event_step_report_markdown,
 )
 from caption_pipeline.frame_caption_fuser import fuse_frame_captions
-from caption_pipeline.io_utils import write_json, write_jsonl, write_text
+from caption_pipeline.io_utils import read_jsonl, write_json, write_jsonl, write_text
 from caption_pipeline.load_inputs import load_audio_features, load_objects, load_ocr
 from caption_pipeline.shot_caption_report import (
     build_shot_caption_report,
@@ -83,6 +85,7 @@ from caption_pipeline.shot_index import (
     rebuild_compact_with_frame_and_shot_captions,
 )
 from caption_pipeline.trake_event_builder import build_trake_event_steps
+from caption_pipeline.runtime import JsonlCheckpoint, TextLLMRuntime, load_env_file
 from caption_pipeline.validation import build_report, render_report_markdown
 
 logger = logging.getLogger("caption_pipeline")
@@ -105,6 +108,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Optional: keyframe map (for future timestamp fallback)
     p.add_argument("--keyframe-map", default="", help="Keyframe map directory (unused in Phase 0)")
+    p.add_argument(
+        "--initial-caption-overrides",
+        default="",
+        help="Optional VLM frame_caption_overrides.jsonl for frame LLM fusion",
+    )
+
+    # Environment and shared text LLM runtime
+    p.add_argument(
+        "--env-file",
+        action="append",
+        default=[],
+        help="Optional KEY=VALUE file loaded before building model config",
+    )
+    p.add_argument("--env-override", action="store_true")
+    p.add_argument("--llm-provider", default="", choices=["", "transformers", "mock"])
+    p.add_argument("--llm-model", default="")
+    p.add_argument("--llm-dtype", default="", choices=["", "bfloat16", "float16", "float32"])
+    p.add_argument("--llm-device-map", default="")
+    p.add_argument("--llm-attention", default="")
+    p.add_argument("--prompt-dir", default="")
+    p.add_argument("--prompt-version", default="")
+    p.add_argument("--llm-max-input-tokens", type=int, default=0)
+    p.add_argument("--frame-max-new-tokens", type=int, default=0)
+    p.add_argument("--shot-max-new-tokens", type=int, default=0)
+    p.add_argument("--trake-max-new-tokens", type=int, default=0)
+    p.add_argument("--llm-max-retries", type=int, default=-1)
+    p.add_argument("--llm-do-sample", action="store_true")
+    p.add_argument("--llm-temperature", type=float, default=None)
+    p.add_argument("--no-resume", action="store_true")
+    p.add_argument("--checkpoint-every", type=int, default=0)
+    p.add_argument("--max-fallback-rate", type=float, default=None)
 
     # Audio alignment
     p.add_argument("--frame-window-before", type=float, default=5.0,
@@ -157,6 +191,7 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         object_jsonl=args.object_jsonl,
         audio_features_jsonl=args.audio_features,
         keyframe_map=args.keyframe_map,
+        initial_caption_overrides=args.initial_caption_overrides,
         output_dir=args.output_dir,
         include_ocr_only_frames=args.include_ocr_only_frames,
         enable_frame_captions=args.enable_frame_captions,
@@ -181,6 +216,52 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         trake_event=TrakeEventConfig(
             event_mode=args.trake_event_mode,
         ),
+        llm=LLMRuntimeConfig(
+            provider=args.llm_provider or os.environ.get("CAPTION_LLM_PROVIDER", "transformers"),
+            model_name=args.llm_model or os.environ.get(
+                "CAPTION_LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct",
+            ),
+            dtype=args.llm_dtype or os.environ.get("CAPTION_LLM_DTYPE", "bfloat16"),
+            device_map=args.llm_device_map or os.environ.get("CAPTION_LLM_DEVICE_MAP", "auto"),
+            attn_implementation=args.llm_attention or os.environ.get("CAPTION_LLM_ATTN", "auto"),
+            prompt_dir=args.prompt_dir or os.environ.get(
+                "CAPTION_PROMPT_DIR",
+                str(Path(__file__).resolve().parent / "caption_pipeline" / "prompts"),
+            ),
+            prompt_version=args.prompt_version or os.environ.get(
+                "CAPTION_PROMPT_VERSION", "caption_qwen25_official_v1",
+            ),
+            max_input_tokens=args.llm_max_input_tokens or _env_int(
+                "CAPTION_LLM_MAX_INPUT_TOKENS", 4096,
+            ),
+            frame_max_new_tokens=args.frame_max_new_tokens or _env_int(
+                "CAPTION_FRAME_MAX_NEW_TOKENS", 128,
+            ),
+            shot_max_new_tokens=args.shot_max_new_tokens or _env_int(
+                "CAPTION_SHOT_MAX_NEW_TOKENS", 256,
+            ),
+            trake_max_new_tokens=args.trake_max_new_tokens or _env_int(
+                "CAPTION_TRAKE_MAX_NEW_TOKENS", 384,
+            ),
+            do_sample=args.llm_do_sample or _env_bool("CAPTION_LLM_DO_SAMPLE", False),
+            temperature=(
+                args.llm_temperature
+                if args.llm_temperature is not None
+                else _env_float("CAPTION_LLM_TEMPERATURE", 0.0)
+            ),
+            max_retries=(
+                args.llm_max_retries
+                if args.llm_max_retries >= 0
+                else _env_int("CAPTION_LLM_MAX_RETRIES", 2)
+            ),
+            resume=not args.no_resume,
+            checkpoint_every=args.checkpoint_every or _env_int("CAPTION_CHECKPOINT_EVERY", 10),
+            max_fallback_rate=(
+                args.max_fallback_rate
+                if args.max_fallback_rate is not None
+                else _env_float("CAPTION_MAX_FALLBACK_RATE", 1.0)
+            ),
+        ),
     )
     cfg.resolve_paths()
     return cfg
@@ -188,6 +269,9 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    for env_file in args.env_file:
+        load_env_file(env_file, override=args.env_override)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -216,6 +300,12 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("Object: %s", cfg.object_jsonl)
     logger.info("Audio:  %s", cfg.audio_features_jsonl)
     logger.info("Output: %s", cfg.output_dir)
+    logger.info(
+        "Modes: frame=%s shot=%s trake=%s",
+        cfg.frame_caption.caption_mode,
+        cfg.shot_caption.caption_mode,
+        cfg.trake_event.event_mode,
+    )
 
     # ---- Phase 0: Load inputs ----
     logger.info("--- Phase 0: Loading inputs ---")
@@ -276,9 +366,43 @@ def main(argv: list[str] | None = None) -> int:
     shot_index = []
     event_records = []
     event_step_index = []
+    llm_runtime: TextLLMRuntime | None = None
+    if _requires_llm(cfg):
+        try:
+            llm_runtime = TextLLMRuntime(cfg.llm)
+            logger.info(
+                "Text LLM ready: provider=%s model=%s prompt_version=%s",
+                llm_runtime.provider,
+                llm_runtime.model_name,
+                llm_runtime.prompt_version,
+            )
+        except Exception:  # noqa: BLE001 - individual stages will create template fallbacks.
+            logger.exception("Text LLM initialization failed; enabled LLM stages will fallback")
+
+    initial_captions = _load_initial_caption_overrides(cfg.initial_caption_overrides)
+    if initial_captions:
+        logger.info("Loaded %d initial VLM captions", len(initial_captions))
+
     if cfg.enable_frame_captions:
         logger.info("--- Phase 2: Generating frame captions ---")
-        caption_records = fuse_frame_captions(frame_evidence, cfg)
+        frame_checkpoint = (
+            _checkpoint_for_task(
+                cfg,
+                llm_runtime,
+                task="frame",
+                filename="frame_caption_records.jsonl",
+                key_field="canonical_frame_id",
+            )
+            if cfg.frame_caption.caption_mode == "llm"
+            else None
+        )
+        caption_records = fuse_frame_captions(
+            frame_evidence,
+            cfg,
+            llm_runtime=llm_runtime,
+            initial_captions=initial_captions,
+            checkpoint=frame_checkpoint,
+        )
 
         logger.info("--- Phase 2: Building frame index ---")
         frame_index = build_frame_index(frame_evidence, caption_records)
@@ -309,7 +433,24 @@ def main(argv: list[str] | None = None) -> int:
     # ---- Phase 3: Shot captions ----
     if cfg.enable_shot_captions:
         logger.info("--- Phase 3: Generating shot captions ---")
-        shot_caption_records = fuse_shot_captions(shot_evidence, frame_index, cfg)
+        shot_checkpoint = (
+            _checkpoint_for_task(
+                cfg,
+                llm_runtime,
+                task="shot",
+                filename="shot_caption_records.jsonl",
+                key_field="shot_id",
+            )
+            if cfg.shot_caption.caption_mode == "llm"
+            else None
+        )
+        shot_caption_records = fuse_shot_captions(
+            shot_evidence,
+            frame_index,
+            cfg,
+            llm_runtime=llm_runtime,
+            checkpoint=shot_checkpoint,
+        )
 
         logger.info("--- Phase 3: Building shot index ---")
         shot_index = build_shot_index(shot_evidence, frame_index, shot_caption_records)
@@ -343,7 +484,24 @@ def main(argv: list[str] | None = None) -> int:
     # ---- Phase 4: TRAKE event steps ----
     if cfg.enable_trake_events:
         logger.info("--- Phase 4: Generating TRAKE event steps ---")
-        event_records = build_trake_event_steps(shot_index, shot_evidence, cfg)
+        trake_checkpoint = (
+            _checkpoint_for_task(
+                cfg,
+                llm_runtime,
+                task="trake",
+                filename="trake_event_records.jsonl",
+                key_field="shot_id",
+            )
+            if cfg.trake_event.event_mode == "llm"
+            else None
+        )
+        event_records = build_trake_event_steps(
+            shot_index,
+            shot_evidence,
+            cfg,
+            llm_runtime=llm_runtime,
+            checkpoint=trake_checkpoint,
+        )
 
         logger.info("--- Phase 4: Building event-step index ---")
         event_step_index = build_event_step_index(
@@ -403,6 +561,13 @@ def main(argv: list[str] | None = None) -> int:
         num_empty = sum(1 for fi in frame_index if not fi.get("caption_text"))
         if num_empty > 0:
             problems.append(f"{num_empty} empty captions")
+        _append_fallback_problem(
+            problems,
+            "frame",
+            caption_records,
+            cfg.llm.max_fallback_rate,
+            cfg.frame_caption.caption_mode,
+        )
     if cfg.enable_shot_captions:
         num_empty_shots = sum(1 for si in shot_index if not si.get("caption_text"))
         num_empty_temporal = sum(1 for si in shot_index if not si.get("temporal_caption"))
@@ -410,6 +575,13 @@ def main(argv: list[str] | None = None) -> int:
             problems.append(f"{num_empty_shots} empty shot captions")
         if num_empty_temporal > 0:
             problems.append(f"{num_empty_temporal} empty temporal captions")
+        _append_fallback_problem(
+            problems,
+            "shot",
+            shot_caption_records,
+            cfg.llm.max_fallback_rate,
+            cfg.shot_caption.caption_mode,
+        )
     if cfg.enable_trake_events:
         num_empty_events = sum(1 for es in event_step_index if not es.get("event_caption"))
         num_empty_trake = sum(1 for es in event_step_index if not es.get("trake_text"))
@@ -430,6 +602,13 @@ def main(argv: list[str] | None = None) -> int:
             problems.append(f"{duplicate_event_ids} duplicate event_ids")
         if duplicate_event_shot_ids > 0:
             problems.append(f"{duplicate_event_shot_ids} duplicate event shot_ids")
+        _append_fallback_problem(
+            problems,
+            "trake",
+            event_records,
+            cfg.llm.max_fallback_rate,
+            cfg.trake_event.event_mode,
+        )
 
     if problems:
         logger.warning("Acceptance issues: %s", "; ".join(problems))
@@ -448,6 +627,82 @@ def _count_duplicates(rows: list[dict], key: str) -> int:
             duplicates += 1
         seen.add(value)
     return duplicates
+
+
+def _requires_llm(cfg: PipelineConfig) -> bool:
+    return any((
+        cfg.enable_frame_captions and cfg.frame_caption.caption_mode == "llm",
+        cfg.enable_shot_captions and cfg.shot_caption.caption_mode == "llm",
+        cfg.enable_trake_events and cfg.trake_event.event_mode == "llm",
+    ))
+
+
+def _load_initial_caption_overrides(path: str) -> dict[str, str]:
+    if not path:
+        return {}
+    target = Path(path)
+    if not target.exists():
+        raise FileNotFoundError(f"Initial caption overrides not found: {target}")
+    results: dict[str, str] = {}
+    for row in read_jsonl(target):
+        frame_id = row.get("canonical_frame_id") or row.get("frame_id") or ""
+        caption = row.get("caption_text", "") or ""
+        if frame_id and caption:
+            results[str(frame_id)] = str(caption)
+    return results
+
+
+def _checkpoint_for_task(
+    cfg: PipelineConfig,
+    runtime: TextLLMRuntime | None,
+    task: str,
+    filename: str,
+    key_field: str,
+) -> JsonlCheckpoint | None:
+    if runtime is None:
+        return None
+    return JsonlCheckpoint(
+        Path(cfg.checkpoints_dir) / filename,
+        key_field=key_field,
+        generation_signature=runtime.task_signature(task),
+        resume=cfg.llm.resume,
+        write_every=cfg.llm.checkpoint_every,
+    )
+
+
+def _append_fallback_problem(
+    problems: list[str],
+    stage: str,
+    rows: list[dict],
+    max_rate: float,
+    mode: str,
+) -> None:
+    if mode != "llm" or not rows:
+        return
+    count = sum(1 for row in rows if row.get("fallback_used"))
+    rate = count / len(rows)
+    if rate > max_rate:
+        problems.append(
+            f"{stage} fallback rate {rate:.3f} exceeds max {max_rate:.3f} "
+            f"({count}/{len(rows)})"
+        )
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return int(value) if value not in {None, ""} else default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    return float(value) if value not in {None, ""} else default
 
 
 if __name__ == "__main__":

@@ -7,8 +7,8 @@ import argparse
 import logging
 import sys
 
+from caption_pipeline.runtime import load_env_file
 from caption_pipeline.vlm_frame_experiment import (
-    load_env_file,
     load_vlm_experiment_config,
     run_vlm_frame_experiment,
 )
