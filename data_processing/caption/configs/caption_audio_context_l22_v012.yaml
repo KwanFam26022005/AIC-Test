@@ -30,7 +30,7 @@ models:
     device_map: auto
     attn_implementation: flash_attention_2
     max_input_tokens: 4096
-    max_new_tokens: 256
+    max_new_tokens: 512
     unload_after_stage: true
 
 frame_selection:
