@@ -1,0 +1,42 @@
+pipeline:
+  version: caption_audio_context_v1
+  video_id: L22_V012
+
+inputs:
+  keyframe_map: ${AIC_ROOT}/keyframe_test
+  keyframes_root: ${AIC_ROOT}/keyframe_test
+  audio_features: ${AIC_ROOT}/outputs/audio/L22_V012/features/audio_features.jsonl
+
+paths:
+  output_root: ${AIC_ROOT}/caption_v2_mock
+  prompt_dir: ""
+
+models:
+  vlm:
+    provider: mock
+    model_name: mock-vlm
+    max_new_tokens: 32
+
+  text_llm:
+    provider: mock
+    model_name: mock-text-llm
+    max_new_tokens: 128
+
+frame_selection:
+  similarity_method: none
+  max_selected_per_shot: 1
+  force_first_last_for_long_shots: false
+
+audio_context:
+  padding_before_sec: 1.5
+  padding_after_sec: 1.5
+  max_audio_context_chars: 1200
+
+generation:
+  shot_max_gap_sec: 5.0
+  shot_max_duration_sec: 20.0
+
+checkpoint:
+  resume: false
+
+strict: true
