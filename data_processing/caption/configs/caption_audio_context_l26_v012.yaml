@@ -1,0 +1,57 @@
+pipeline:
+  version: caption_audio_context_v1
+  video_id: L26_V012
+
+inputs:
+  keyframe_map: /tmp2/maitanha/vgu/ttn/data/AIC2025/map_keyframes/L26_V012.csv
+  keyframes_root: /tmp2/maitanha/vgu/ttn/data/AIC2025/keyframes/Keyframes_L26/L26_V012
+  audio_features: ${AIC_ROOT}/outputs/audio/L26_V012/features/audio_features.jsonl
+
+paths:
+  output_root: ${AIC_ROOT}/caption_v2
+  prompt_dir: ""
+
+models:
+  vlm:
+    provider: qwen2_5_vl
+    model_name: Qwen/Qwen2.5-VL-7B-Instruct
+    dtype: bfloat16
+    device_map: auto
+    attn_implementation: flash_attention_2
+    batch_size: 2
+    max_visual_tokens: 1280
+    max_new_tokens: 64
+    unload_after_stage: true
+
+  text_llm:
+    provider: transformers
+    model_name: Qwen/Qwen2.5-7B-Instruct
+    dtype: bfloat16
+    device_map: auto
+    attn_implementation: flash_attention_2
+    max_input_tokens: 4096
+    max_new_tokens: 512
+    unload_after_stage: true
+
+frame_selection:
+  similarity_method: phash
+  novelty_threshold: 0.30
+  min_selected_per_shot: 1
+  max_selected_per_shot: 1
+  force_first_last_for_long_shots: false
+  long_shot_min_frames: 6
+
+audio_context:
+  padding_before_sec: 1.5
+  padding_after_sec: 1.5
+  max_audio_context_chars: 1200
+
+generation:
+  shot_max_gap_sec: 5.0
+  shot_max_duration_sec: 20.0
+
+checkpoint:
+  resume: true
+  write_every: 10
+
+strict: true

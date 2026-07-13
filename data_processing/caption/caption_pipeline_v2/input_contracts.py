@@ -2,7 +2,7 @@
 
 Phase 0 responsibilities:
   - Resolve paths and validate existence.
-  - Load keyframe map (JSONL or directory scan).
+  - Load keyframe map (CSV/JSONL or directory scan).
   - Load audio features (read-only, filter usable_for_caption).
   - Reject duplicate canonical frame IDs.
   - Validate monotonic timestamps.
@@ -63,7 +63,7 @@ def load_keyframes(
     keyframes_root: str | Path,
     video_id: str,
 ) -> list[dict[str, Any]]:
-    """Load keyframes from a JSONL map or by scanning a directory.
+    """Load keyframes from a CSV/JSONL map or by scanning a directory.
 
     Each returned dict has at minimum:
         video_id, canonical_frame_id, keyframe_idx, source_frame_idx,
@@ -73,8 +73,10 @@ def load_keyframes(
     root_path = Path(keyframes_root)
 
     frames: list[dict[str, Any]]
-    if map_path.is_file() and map_path.suffix in (".jsonl", ".json"):
+    if map_path.is_file() and map_path.suffix.lower() in (".jsonl", ".json"):
         frames = _load_from_jsonl(map_path, root_path, video_id)
+    elif map_path.is_file() and map_path.suffix.lower() == ".csv":
+        frames = _load_from_csv_map(map_path, root_path, video_id)
     elif map_path.is_dir():
         frames = _load_from_directory(map_path, video_id)
     elif root_path.is_dir():
@@ -90,6 +92,35 @@ def load_keyframes(
     logger.info(
         "Input contracts: loaded %d keyframes for %s", len(frames), video_id,
     )
+    return frames
+
+
+def _load_from_csv_map(
+    path: Path, root: Path, video_id: str,
+) -> list[dict[str, Any]]:
+    """Load keyframe metadata from an AIC CSV map.
+
+    The common AIC format is ``n,pts_time,fps,frame_idx`` while images are
+    stored as ``001.jpg``, ``002.jpg`` ... in either ``root`` or
+    ``root/<video_id>``.
+    """
+    rows = _load_keyframe_csv(path)
+    frames: list[dict[str, Any]] = []
+    for row in rows:
+        n = int(row.get("n") or 0)
+        if n <= 0:
+            continue
+        stem = f"{n:03d}"
+        image_path, image_relpath = _find_keyframe_image(root, video_id, stem)
+        frames.append({
+            "video_id": video_id,
+            "canonical_frame_id": f"{video_id}_{stem}",
+            "keyframe_idx": n,
+            "source_frame_idx": row.get("frame_idx"),
+            "timestamp_sec": _round_sec(row.get("pts_time"), 3),
+            "image_path": str(image_path) if image_path else "",
+            "image_relpath": image_relpath,
+        })
     return frames
 
 
@@ -209,6 +240,23 @@ def _load_keyframe_csv(path: Path) -> list[dict[str, Any]]:
             except ValueError:
                 continue
     return rows
+
+
+def _find_keyframe_image(
+    root: Path,
+    video_id: str,
+    stem: str,
+) -> tuple[Path | None, str]:
+    """Resolve a keyframe image from a numeric stem such as ``001``."""
+    candidates: list[tuple[Path, str]] = []
+    for ext in (".jpg", ".jpeg", ".png"):
+        candidates.append((root / f"{stem}{ext}", f"{stem}{ext}"))
+        candidates.append((root / video_id / f"{stem}{ext}", f"{video_id}/{stem}{ext}"))
+    for path, relpath in candidates:
+        if path.exists():
+            return path, relpath
+    # Return the most likely path for diagnostics even when it is absent.
+    return root / f"{stem}.jpg", f"{stem}.jpg"
 
 
 def _validate_keyframes(frames: list[dict], video_id: str) -> None:
