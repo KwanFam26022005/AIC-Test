@@ -329,7 +329,24 @@ def generate_shot_captions(
                     "quality_levels": audio_context.get("quality_levels", []),
                 }),
             }
-            outcome = runtime.generate(values)
+            try:
+                outcome = runtime.generate(values)
+            except Exception as exc:
+                logger.error(
+                    "Shot ReCap LLM failed for %s; using deterministic fallback",
+                    shot["shot_id"],
+                    exc_info=True,
+                )
+                outcome = {
+                    "data": _mock_payload(values),
+                    "attempts": 0,
+                    "raw_output": "",
+                    "elapsed_ms": 0,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "generation_mode": "fallback",
+                    "warnings": [f"shot_recap_llm_fallback: {exc}"],
+                }
             data = outcome["data"]
             memory_after = truncate_memory(data["memory_after"], cfg.max_memory_chars)
             memory = dict(memory_after)
@@ -356,7 +373,7 @@ def generate_shot_captions(
                     memory_after=memory_after,
                     reset_applied=reset,
                     reset_reason=reason,
-                    source_generation_mode="text_recap",
+                    source_generation_mode=row["caption"]["mode"],
                     input_signature=row["provenance"]["input_signature"],
                 )
             )
@@ -466,7 +483,7 @@ def _build_shot_row(
             "event_caption": data["event_caption"],
             "trake_text": data["trake_text"],
             "language": "en",
-            "mode": "text_recap",
+            "mode": outcome.get("generation_mode", "text_recap"),
         },
         "structure": {
             "action_state": data["action_state"],
@@ -493,8 +510,8 @@ def _build_shot_row(
             "elapsed_ms": outcome.get("elapsed_ms", 0),
         },
         "quality": {
-            "valid": True,
-            "warnings": [],
+            "valid": outcome.get("generation_mode", "text_recap") != "fallback",
+            "warnings": outcome.get("warnings", []),
         },
         "provenance": {
             "input_signature": input_signature,
